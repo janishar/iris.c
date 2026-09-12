@@ -3,6 +3,10 @@
 
 # Compiled binaries
 flux
+iris
+
+# Generated at build time (xxd-embedded Metal shader source)
+iris_shaders_source.h
 
 # Model weights (large files)
 flux-klein-*/
