@@ -34,6 +34,10 @@ extern "C" {
 #define QWEN3_EXTRACT_FLUX     0
 #define QWEN3_EXTRACT_ZIMAGE   1
 #define QWEN3_EXTRACT_FLUX3    2
+#define QWEN3_EXTRACT_QIMAGE   3
+
+/* Qwen-Image 2.1 system message; its tokens are dropped from the output. */
+#define QWEN3_QIMAGE_SYSTEM "Comprehend and analyze the provided prompt."
 
 /* ========================================================================
  * Opaque Types
@@ -63,6 +67,15 @@ void qwen3_tokenizer_free(qwen3_tokenizer_t *tok);
  */
 int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
                          int *num_tokens, int max_len, int skip_think_tags);
+
+/*
+ * Tokenize with a system message and no <think> block (Qwen-Image 2.1):
+ * <|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
+ * num_system receives the number of system-block tokens.
+ */
+int *qwen3_tokenize_chat_system(qwen3_tokenizer_t *tok, const char *system,
+                                const char *prompt, int *num_tokens,
+                                int *num_system, int max_len);
 
 /*
  * Pad tokens to max_len with PAD token.
@@ -124,7 +137,7 @@ typedef struct qwen3_encoder {
 /*
  * Load complete text encoder (tokenizer + model).
  * model_dir should contain text_encoder/ and the tokenizer, either in
- * tokenizer/ or (Flux3) inside text_encoder/.
+ * tokenizer/, (Flux3) inside text_encoder/ or (Qwen-Image) in processor/.
  * use_mmap: if true, use memory-mapped bf16 weights (saves ~8GB, slower inference)
  */
 qwen3_encoder_t *qwen3_encoder_load(const char *model_dir, int use_mmap);
@@ -134,6 +147,8 @@ qwen3_encoder_t *qwen3_encoder_load(const char *model_dir, int use_mmap);
  *   QWEN3_EXTRACT_FLUX:   hidden_states[9,18,27] concatenated -> [seq, 3*hidden]
  *   QWEN3_EXTRACT_ZIMAGE: hidden_states[-2] only -> [seq, hidden]
  *   QWEN3_EXTRACT_FLUX3:  hidden_states[4,8,...,32] -> [seq, 8*hidden]
+ *   QWEN3_EXTRACT_QIMAGE: last layer before the final norm -> [seq, hidden],
+ *                         system-block tokens dropped, padding not returned
  * Flux and Z-Image pad prompts to 512 tokens; Flux3 pads to a multiple of
  * 80 tokens and places the padding at RoPE position 1, like the
  * transformers version it was trained with.

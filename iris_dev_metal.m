@@ -648,6 +648,11 @@ static void copy_2d(uint16_t *dst, int ldd, const uint16_t *src, int lds, int ro
     end_elementwise(e, n);
 }
 
+void iris_dev_copy_2d(uint16_t *dst, int ldd, const uint16_t *src, int lds, int rows, int cols) {
+    if (!rows || !cols) return;
+    @autoreleasepool { copy_2d(dst, ldd, src, lds, rows, cols); }
+}
+
 /* ========================================================================
  * MPSGraph: GEMM and Attention
  * ======================================================================== */

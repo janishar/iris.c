@@ -110,6 +110,28 @@ FLUX3_TESTS = [
 ]
 
 
+# Optional Qwen-Image 2.1 smoke test (base or Turbo; 8 steps is Turbo's
+# fixed grid). A reference image from debug/qimage_reference.py, started
+# from the noise iris generates for the seed, can replace the size check.
+QIMAGE_SMOKE_TEST = {
+    "name": "Qwen-Image 2.1 smoke test (8 steps, 256x256)",
+    "prompt": "A fluffy orange cat sitting on a windowsill",
+    "seed": 42,
+    "steps": 8,
+    "width": 256,
+    "height": 256,
+}
+
+
+def is_qimage_model_dir(model_dir: Path) -> bool:
+    """Return True if model_dir looks like a Qwen-Image 2.1 model directory."""
+    model_index = model_dir / "model_index.json"
+    try:
+        return "QwenImage21Pipeline" in model_index.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+
+
 def is_flux3_model_dir(model_dir: Path) -> bool:
     """Return True if model_dir looks like a FLUX.3 model directory."""
     config = model_dir / "transformer" / "config.json"
@@ -235,6 +257,8 @@ def main():
                         help="Optional Z-Image model dir (auto-detected if omitted)")
     parser.add_argument("--flux3-model-dir", default=None,
                         help="Optional FLUX.3 model dir (auto-detected if omitted)")
+    parser.add_argument("--qimage-model-dir", default=None,
+                        help="Optional Qwen-Image 2.1 model dir (auto-detected if omitted)")
     parser.add_argument("--quick", action="store_true", help="Run only the quick 64x64 test")
     parser.add_argument("--full", action="store_true",
                         help="Also run slow tests that require visual inspection")
@@ -246,13 +270,15 @@ def main():
         tests_to_run = list(TESTS)
     full_tests_to_run = list(FULL_TESTS) if args.full else []
 
-    # Optional Z-Image and FLUX.3 coverage: run only in non-quick mode.
+    # Optional Z-Image, FLUX.3 and Qwen-Image coverage: run only in non-quick mode.
     scheduled_tests: list[tuple[dict, str]] = [(t, args.model_dir) for t in tests_to_run]
     optional = [
         ("Z-Image", "--zimage-model-dir", args.zimage_model_dir, [ZIMAGE_SMOKE_TEST],
          ("zimage-turbo", "zimage", "Z-Image-Turbo"), is_zimage_model_dir),
         ("FLUX.3", "--flux3-model-dir", args.flux3_model_dir, FLUX3_TESTS,
          ("flux-3-klein", "flux-3-klein-base"), is_flux3_model_dir),
+        ("Qwen-Image", "--qimage-model-dir", args.qimage_model_dir, [QIMAGE_SMOKE_TEST],
+         ("qwen-image-2.1-turbo", "qwen-image-2.1"), is_qimage_model_dir),
     ]
     for label, flag, explicit, tests, names, matches in optional:
         if args.quick:

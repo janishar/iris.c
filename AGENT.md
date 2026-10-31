@@ -1,11 +1,13 @@
-This is a C implementation of three image synthesis model families:
+This is a C implementation of four image synthesis model families:
 - Flux.2 Klein (4B and 9B variants)
 - Z-Image-Turbo (6B)
 - FLUX.3 Image Klein (5.6B)
+- Qwen-Image 2.1 (about 7B transformer, base and Turbo)
 
 The project is called "Iris" (from the Greek goddess of the rainbow).
 The Flux models are created by Black Forest Labs.
 Z-Image-Turbo is published as `Tongyi-MAI/Z-Image-Turbo`.
+Qwen-Image 2.1 is published as `Qwen/Qwen-Image-2.1` and `Qwen/Qwen-Image-2.1-Turbo`.
 
 Model type and architecture are autodetected from model metadata/config files.
 Do not rely on hardcoded dimensions when a config value is available.
@@ -16,6 +18,7 @@ Do not rely on hardcoded dimensions when a config value is available.
 - **`_flux`** postfix on internal functions/types specific to the Flux model family
 - **`_zimage`** postfix on internal functions/types specific to Z-Image
 - **`_flux3`** postfix on internal functions/types specific to FLUX.3
+- **`_qimage`** postfix on internal functions/types specific to Qwen-Image 2.1
 - **No postfix** on public API functions (they route internally by model type)
 - **Unchanged**: `qwen3_*`, `safetensors_*`, `zi_*` internal helpers (component-level namespaces)
 
@@ -34,6 +37,11 @@ FLUX.3 variants (FLUX Kommunity License):
 - **Image Klein** (`flux-3-klein`): step-distilled flow map, 16 steps default (trained for 4..16), no CFG.
 - **Image Klein Base** (`flux-3-klein-base`): 50 steps, CFG 3.5.
 
+Qwen-Image 2.1 variants (Qwen Research License, non-commercial):
+- **Turbo** (`qwen-image-2.1-turbo`): fixed 8-sigma grid from `model_index.json`
+  (`sample_sigmas`), no CFG. `--steps` cannot change it.
+- **Base** (`qwen-image-2.1`): 40 steps default, no CFG (upstream default too).
+
 # High-Level Capabilities
 
 - Flux supports both txt2img and img2img with text conditioning.
@@ -42,6 +50,8 @@ FLUX.3 variants (FLUX Kommunity License):
   are prepared like the official image processor: one reference is kept whole
   (downscaled so its 16-px canvas fits 4 MP, reflect-padded, output cropped back),
   several are downscaled under 1 MP and center-cropped. Side cap: IRIS_VAE_MAX_DIM.
+- Qwen-Image currently supports txt2img only (references need the Qwen3-VL
+  vision tower and the VAE encoder).
 - Text embeddings are generated via Qwen3.
 - VAE is used for latent/image conversion in both families.
 
@@ -52,6 +62,9 @@ iris.c                    - Main library (model load, generation routing)
 iris_transformer_flux.c   - Flux diffusion transformer (MMDiT)
 iris_transformer_zimage.c - Z-Image transformer (S3-DiT)
 iris_transformer_flux3.c  - FLUX.3 transformer (per-mode + joint blocks)
+iris_transformer_qimage.c - Qwen-Image 2.1 transformer (single-stream, text prefix KV)
+iris_vae_qimage.c         - Qwen-Image 2.1 VAE decoder (Wan-derived, 2D)
+iris_qimage.h             - Qwen-Image internal API (scheduler, transformer, VAE)
 iris_sample.c             - Sampling/denoising loops (Euler ODE)
 iris_qwen3.c              - Qwen3 text encoder
 iris_qwen3_tokenizer.c    - BPE tokenizer
@@ -114,6 +127,10 @@ FLUX.3 example:
 
     ./iris -d flux-3-klein -p "a fish" -o /tmp/flux3.png
 
+Qwen-Image example:
+
+    ./iris -d qwen-image-2.1-turbo -p "a fish" -W 1024 -H 1024 -o /tmp/qimage.png
+
 If model weights are missing, use the download script only after user approval.
 
 # Python Reference Implementations
@@ -135,6 +152,15 @@ FLUX.3 reference:
   VAE decode) on the official Flux3Transformer2DModel source, fetched from a
   pinned diffusers commit (FLUX.3 is not in a diffusers release yet). Dumps
   every intermediate tensor as raw float32; `--noise` starts from a C noise file.
+
+Qwen-Image reference:
+- `debug/qimage_reference.py`: the QwenImage21Pipeline text-to-image loop on
+  the official diffusers classes (encode_prompt, KV cache, scheduler, VAE) in
+  float32. Dumps tokens, embeddings, sigmas, RoPE, per-step v/x, per-block
+  states, latent and image. `--emb` skips the text encoder, `--decode` only
+  decodes a latent. C side: `./iris -d MODEL -e emb.bin --noise noise.bin`.
+- `debug/dump_noise.c`: writes the noise iris draws for a seed, for `--noise`.
+- `debug/dump_emb.c`: writes the text embeddings iris computes for a prompt.
 
 Rules:
 - Never add/commit `flux_env/` or `flux2/`.
@@ -447,6 +473,52 @@ axes_dims_rope=[32,32,32,32], rope_theta=10000, flow_map=true (distilled).
 4. **Metal weight cache keys**: on MPS builds, Flux3 linears pass the mmapped
    bf16 weight pointers; a reused f32 conversion scratch would be served stale.
 
+# Qwen-Image 2.1 Architecture
+
+Transformer config (reference): dim=4096, heads=32, head_dim=128, 32 blocks,
+mlp_ratio=3, in/out channels 64, patch_size 1, axes_dims_rope=[16,56,56],
+theta 10000 (hardcoded upstream), eps 1e-6, causal_condition=true. No biases.
+
+- Sequence `[TEXT | IMAGE]`; image tokens are latent pixels in raster order.
+- Block (sequential): `x += tanh(g1) * attn(LN(x) * (1 + s1))`, then
+  `x += tanh(g2) * mlp(LN(x) * (1 + s2))`; no shift. MLP is
+  `out(silu(gate_layer(n)) * proj(n))`.
+- One modulation projection for all blocks: `[s1, g1, s2, g2]`. Text uses
+  t = 0, image tokens t. Output layer: `LN(x) * (1 + scale)` (scale only).
+- Attention: text causal, image tokens see all text and image tokens.
+- Text input: RMSNorm with weight + 1 (zero-centered), linear, GELU-tanh, linear.
+- RoPE consecutive pairs; text token i at (i, i, i); image (T, r - (H - H/2),
+  c - (W - W/2)), T the text length. Angles are float32 like the reference.
+- Text is independent of the image and the step, so iris prefills its K/V
+  once per prompt (the reference KV cache, filled before step 0) and each
+  step runs only image tokens against them.
+- Scheduler: FlowMatchEulerDiscreteScheduler settings read from
+  `scheduler/scheduler_config.json`, applied to Turbo's sample_sigmas too.
+- VAE: decoder only, 2D convs, per-pixel RMS norms (F.normalize * sqrt(C) *
+  gamma), residual up blocks with a DupUp shortcut, mid single-head attention,
+  RGBA out. Latent denorm `z * std + mean` (64 values each from config).
+
+# Qwen-Image Text Encoder
+
+- Qwen3-VL-8B text model (`model.language_model.`), same shape as Qwen3-8B.
+- Raw template with a system message, no `<think>`; the system block tokens
+  are dropped. Embedding = last layer output BEFORE the final norm.
+- Only real tokens reach the transformer; the encoder pads to a multiple of
+  80 after them (causal, so harmless).
+- Tokenizer may live in `processor/`; Turbo's encoder may be one
+  `model.safetensors`.
+
+# Qwen-Image Known Pitfalls
+
+1. **Turbo sigmas are shifted too**: the pipeline passes sample_sigmas through
+   the scheduler's dynamic shift and terminal stretch; do not special-case
+   Turbo, read the scheduler config.
+2. **DupUp shortcut**: `out[o, 2y+i, 2x+j] = in[(((o*ft + ft-1)*2+i)*2+j) /
+   repeats, y, x]` (first_chunk keeps temporal slot ft-1). It is not a plain
+   nearest upsample for the channel-reducing blocks.
+3. **Device path rounding**: bf16 activations give about 1% relative error vs
+   the float32 reference, the same as running upstream in bf16.
+
 # Device Backend (CUDA / ROCm / Metal)
 
 - iris_dev.h is a small API for GPU-resident inference: plain device pointers,
@@ -457,6 +529,8 @@ axes_dims_rope=[32,32,32,32], rope_theta=10000, flow_map=true (distilled).
   Never key device data on host pointers (see the Metal pitfalls above).
 - GEMMs: bf16 inputs, f32 accumulation. Fused weights are assembled on the
   device with iris_dev_upload()/iris_dev_upload_2d().
+- iris_dev_copy_2d(): stream-ordered device-to-device bf16 copy (Qwen-Image
+  copies each block's cached text K|V into the shared QKV buffer with it).
 - Attention: flash kernels for head_dim 128, non-causal, optional key mask
   (CUDA: mma.sync + cp.async + ldmatrix; ROCm: gfx11 WMMA, computing transposed
   products so each lane owns a query). Other cases use batched GEMMs around a
@@ -500,6 +574,12 @@ Manual FLUX.3 sanity:
 ```bash
 ./iris -d flux-3-klein -p "A fluffy orange cat sitting on a windowsill" \
   --seed 42 --steps 4 -W 256 -H 256 -o /tmp/flux3_test.png
+```
+
+Manual Qwen-Image sanity:
+```bash
+./iris -d qwen-image-2.1-turbo -p "A fluffy orange cat sitting on a windowsill" \
+  --seed 42 -W 256 -H 256 -o /tmp/qimage_test.png
 ```
 
 # Flux Known Pitfalls (Historical Bugs)

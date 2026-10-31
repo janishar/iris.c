@@ -42,6 +42,10 @@ void iris_dev_upload_2d(void *dst, size_t dst_stride, const void *src, size_t sr
                         size_t row_bytes, size_t rows);
 void iris_dev_sync(void);
 
+/* Device-to-device copy of a bf16 matrix, in stream order (no sync):
+ * dst[r, c] = src[r, c] for r < rows, c < cols, row strides ldd / lds. */
+void iris_dev_copy_2d(uint16_t *dst, int ldd, const uint16_t *src, int lds, int rows, int cols);
+
 /* dst[i] = bf16(src[i]) */
 void iris_dev_f32_to_bf16(uint16_t *dst, const float *src, size_t n);
 

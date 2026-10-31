@@ -84,6 +84,7 @@ static const char *schedule_name(int sched) {
     default:
         if (iris_is_zimage(state.ctx)) return "flowmatch (default)";
         if (iris_is_flux3(state.ctx)) return "shifted flowmatch (default)";
+        if (iris_is_qimage(state.ctx)) return "checkpoint flowmatch (default)";
         return "sigmoid (default)";
     }
 }
@@ -393,8 +394,8 @@ static int generate_image(const char *prompt, const char *ref_image,
     /* Validate / preload reference before enabling progress callbacks. */
     iris_image *ref = NULL;
     if (ref_image) {
-        if (iris_is_zimage(state.ctx)) {
-            fprintf(stderr, "Error: img2img is not supported for Z-Image.\n");
+        if (iris_is_zimage(state.ctx) || iris_is_qimage(state.ctx)) {
+            fprintf(stderr, "Error: img2img is not supported for this model.\n");
             return -1;
         }
         ref = iris_image_load(ref_image);
@@ -512,8 +513,8 @@ static int generate_image(const char *prompt, const char *ref_image,
 
 static int generate_multiref(const char *prompt, const char **ref_paths, int num_refs,
                              int explicit_width, int explicit_height) {
-    if (iris_is_zimage(state.ctx)) {
-        fprintf(stderr, "Error: multi-reference img2img is not supported for Z-Image.\n");
+    if (iris_is_zimage(state.ctx) || iris_is_qimage(state.ctx)) {
+        fprintf(stderr, "Error: multi-reference img2img is not supported for this model.\n");
         return -1;
     }
 
@@ -618,8 +619,8 @@ static void cmd_help(void) {
     printf("  !seed <n>             Set seed (-1 for random)\n");
     printf("  !size <W>x<H>         Set default size\n");
     printf("  !steps <n>            Set sampling steps (0 = auto)\n");
-    if (iris_is_zimage(state.ctx)) {
-        printf("  !guidance <n>         Set guidance (ignored for Z-Image, fixed at 0.0)\n");
+    if (iris_is_zimage(state.ctx) || iris_is_qimage(state.ctx)) {
+        printf("  !guidance <n>         Set guidance (ignored for this model, fixed at 0.0)\n");
     } else {
         printf("  !guidance <n>         Set CFG guidance scale (0 = auto)\n");
     }
@@ -787,9 +788,9 @@ static void cmd_guidance(char *arg) {
         return;
     }
 
-    if (iris_is_zimage(state.ctx)) {
+    if (iris_is_zimage(state.ctx) || iris_is_qimage(state.ctx)) {
         state.guidance = 0.0f;
-        printf("Guidance is fixed to 0.0 for Z-Image.\n");
+        printf("Guidance is fixed to 0.0 for this model.\n");
         return;
     }
 
@@ -1133,6 +1134,8 @@ static void print_banner(void) {
         printf("Type: Z-Image-Turbo (S3-DiT)\n");
     } else if (iris_is_flux3(state.ctx)) {
         printf("Type: FLUX.3 %s\n", iris_is_distilled(state.ctx) ? "distilled" : "base (CFG)");
+    } else if (iris_is_qimage(state.ctx)) {
+        printf("Type: Qwen-Image 2.1 (single-stream DiT, no CFG)\n");
     } else {
         printf("Type: %s\n", iris_is_distilled(state.ctx) ? "distilled" : "base (CFG)");
     }

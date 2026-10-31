@@ -1115,6 +1115,79 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
     return tokens;
 }
 
+/* Append n token ids to the growable array tokens[*total], *capacity. */
+static int *append_tokens(int *tokens, int *total, int *capacity, const int *ids, int n) {
+    if (*total + n > *capacity) {
+        while (*total + n > *capacity) *capacity *= 2;
+        tokens = realloc(tokens, *capacity * sizeof(int));
+    }
+    memcpy(tokens + *total, ids, n * sizeof(int));
+    *total += n;
+    return tokens;
+}
+
+/* Tokenize the raw template (Qwen-Image 2.1, no <think> block)
+ *   <|im_start|>system\n{system}<|im_end|>\n
+ *   <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
+ * Each role header is tokenized together with its text, as the reference
+ * tokenizes the whole string (the special tokens split it). num_system
+ * receives the length of the system block, which callers drop from the
+ * encoder output. An empty prompt becomes " ". Over max_len tokens the
+ * end of the prompt is cut, keeping the template tail. */
+int *qwen3_tokenize_chat_system(qwen3_tokenizer_t *tok, const char *system,
+                                const char *prompt, int *num_tokens,
+                                int *num_system, int max_len) {
+    static const int im_start = QWEN3_IM_START_ID, im_end = QWEN3_IM_END_ID;
+    if (!prompt[0]) prompt = " ";
+
+    size_t sys_len = strlen(system), prompt_len = strlen(prompt);
+    char *sys_text = malloc(sys_len + 8);
+    char *user_text = malloc(prompt_len + 8);
+    sprintf(sys_text, "system\n%s", system);
+    sprintf(user_text, "user\n%s", prompt);
+
+    int n_sys, n_user, n_nl, n_asst;
+    int *sys_ids = qwen3_tokenize(tok, sys_text, &n_sys, INT_MAX);
+    int *user_ids = qwen3_tokenize(tok, user_text, &n_user, INT_MAX);
+    int *nl_ids = qwen3_tokenize(tok, "\n", &n_nl, INT_MAX);
+    int *asst_ids = qwen3_tokenize(tok, "assistant\n", &n_asst, INT_MAX);
+    free(sys_text);
+    free(user_text);
+
+    /* Fixed parts around the user text: the system block, the user
+     * <|im_start|>, then <|im_end|>\n<|im_start|>assistant\n. */
+    int fixed = (2 + n_sys + n_nl) + 1 + (1 + n_nl + 1 + n_asst);
+    int total_full = fixed + n_user;
+    if (total_full > max_len) {
+        int keep = max_len - fixed;
+        if (keep < 1) keep = 1;
+        fprintf(stderr, "\nWarning: prompt truncated from %d to %d tokens "
+                "(text encoder limit)\n", total_full, fixed + keep);
+        n_user = keep;
+    }
+
+    int capacity = 256, total = 0;
+    int *tokens = malloc(capacity * sizeof(int));
+    tokens = append_tokens(tokens, &total, &capacity, &im_start, 1);
+    tokens = append_tokens(tokens, &total, &capacity, sys_ids, n_sys);
+    tokens = append_tokens(tokens, &total, &capacity, &im_end, 1);
+    tokens = append_tokens(tokens, &total, &capacity, nl_ids, n_nl);
+    *num_system = total;
+    tokens = append_tokens(tokens, &total, &capacity, &im_start, 1);
+    tokens = append_tokens(tokens, &total, &capacity, user_ids, n_user);
+    tokens = append_tokens(tokens, &total, &capacity, &im_end, 1);
+    tokens = append_tokens(tokens, &total, &capacity, nl_ids, n_nl);
+    tokens = append_tokens(tokens, &total, &capacity, &im_start, 1);
+    tokens = append_tokens(tokens, &total, &capacity, asst_ids, n_asst);
+
+    free(sys_ids);
+    free(user_ids);
+    free(nl_ids);
+    free(asst_ids);
+    *num_tokens = total;
+    return tokens;
+}
+
 /*
  * Pad token sequence to max_len with PAD tokens.
  * Returns new array, caller must free original.

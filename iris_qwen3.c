@@ -301,6 +301,9 @@ static int qwen3_output_layers(const qwen3_model_t *model, int *layers) {
     case QWEN3_EXTRACT_FLUX3:   /* hidden_states[4, 8, ..., 32] */
         for (int i = 0; i < 8; i++) layers[i] = 4 * (i + 1) - 1;
         return 8;
+    case QWEN3_EXTRACT_QIMAGE:  /* last layer, before the final norm */
+        layers[0] = model->num_layers - 1;
+        return 1;
     default:                    /* hidden_states[9, 18, 27] */
         layers[0] = 8;
         layers[1] = 17;
@@ -1771,7 +1774,11 @@ static int open_safetensors_shards(const char *model_dir,
 
     if (files[0]) safetensors_close(files[0]);
     if (files[1]) safetensors_close(files[1]);
-    return 0;
+
+    /* Single file (Qwen-Image 2.1 Turbo from the Hub) */
+    snprintf(path1, sizeof(path1), "%s/model.safetensors", model_dir);
+    files[0] = safetensors_open(path1);
+    return files[0] ? 1 : 0;
 }
 
 /* Detect plain Qwen3 vs the text model of Qwen3-VL (Flux3) from the
@@ -2020,12 +2027,18 @@ qwen3_encoder_t *qwen3_encoder_load(const char *model_dir, int use_mmap) {
     qwen3_encoder_t *enc = calloc(1, sizeof(qwen3_encoder_t));
     if (!enc) return NULL;
 
-    /* Load tokenizer (Flux3 ships it inside text_encoder/) */
+    /* Load tokenizer (Flux3 ships it inside text_encoder/, Qwen-Image
+     * inside processor/) */
+    static const char *tok_dirs[] = {"tokenizer", "text_encoder", "processor"};
     char tok_path[512];
-    snprintf(tok_path, sizeof(tok_path), "%s/tokenizer/tokenizer.json", model_dir);
-    FILE *tf = fopen(tok_path, "r");
-    if (tf) fclose(tf);
-    else snprintf(tok_path, sizeof(tok_path), "%s/text_encoder/tokenizer.json", model_dir);
+    for (int i = 0; i < 3; i++) {
+        snprintf(tok_path, sizeof(tok_path), "%s/%s/tokenizer.json", model_dir, tok_dirs[i]);
+        FILE *tf = fopen(tok_path, "r");
+        if (tf) {
+            fclose(tf);
+            break;
+        }
+    }
     enc->tokenizer = qwen3_tokenizer_load(tok_path);
     if (!enc->tokenizer) {
         fprintf(stderr, "qwen3_encoder_load: failed to load tokenizer\n");
@@ -2071,27 +2084,35 @@ void qwen3_encoder_free(qwen3_encoder_t *enc) {
 }
 
 /* Main text encoding API. Tokenizes the prompt using Qwen3 chat template
- * (with <think> tags for Flux only), pads it (to 512 tokens, or for Flux3
- * to the next multiple of 80), runs the forward pass, and returns the
- * extracted embeddings. Also returns the number of real (non-padding)
- * tokens via out_num_tokens, which Z-Image needs for its unpadded
- * attention over text tokens, and the padded length via out_seq_len. */
+ * (with <think> tags for Flux only, with a system message for Qwen-Image),
+ * pads it (to 512 tokens, or for the Qwen3-VL models to the next multiple
+ * of 80), runs the forward pass, and returns the extracted embeddings.
+ * Also returns the number of real (non-padding) tokens via out_num_tokens,
+ * which Z-Image needs for its unpadded attention over text tokens, and the
+ * padded length via out_seq_len. Qwen-Image returns only the real tokens
+ * after its system block, and both counts are that number. */
 float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
                               int *out_num_tokens, int *out_seq_len) {
     if (!enc || !enc->tokenizer || !enc->model || !prompt) return NULL;
 
     int mode = enc->model->extraction_mode;
-    int max_len = (mode == QWEN3_EXTRACT_FLUX3) ? enc->model->max_seq_len
-                                                : QWEN3_MAX_SEQ_LEN;
+    int vl = mode == QWEN3_EXTRACT_FLUX3 || mode == QWEN3_EXTRACT_QIMAGE;
+    int max_len = vl ? enc->model->max_seq_len : QWEN3_MAX_SEQ_LEN;
 
     /* Tokenize with chat template */
-    int num_tokens;
-    int *tokens = qwen3_tokenize_chat(enc->tokenizer, prompt, &num_tokens,
-                                      max_len, mode != QWEN3_EXTRACT_FLUX);
+    int num_tokens, num_system = 0;
+    int *tokens = (mode == QWEN3_EXTRACT_QIMAGE)
+        ? qwen3_tokenize_chat_system(enc->tokenizer, QWEN3_QIMAGE_SYSTEM, prompt,
+                                     &num_tokens, &num_system, max_len)
+        : qwen3_tokenize_chat(enc->tokenizer, prompt, &num_tokens,
+                              max_len, mode != QWEN3_EXTRACT_FLUX);
     if (!tokens) return NULL;
 
+    /* Qwen3-VL prompts pad to a multiple of 80. For Qwen-Image the padding
+     * only follows the real tokens, which the causal encoder keeps
+     * unchanged, and is dropped below. */
     int seq_len = max_len;
-    if (mode == QWEN3_EXTRACT_FLUX3) {
+    if (vl) {
         int m = QWEN3_FLUX3_PAD_MULTIPLE;
         seq_len = (num_tokens + m - 1) / m * m;
         if (seq_len > max_len) seq_len = max_len;
@@ -2115,6 +2136,15 @@ float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
 
     free(padded_tokens);
     free(attention_mask);
+
+    /* Qwen-Image: keep the real tokens after the system block. */
+    if (embeddings && mode == QWEN3_EXTRACT_QIMAGE) {
+        size_t row = (size_t)enc->model->hidden_size;
+        num_tokens -= num_system;
+        memmove(embeddings, embeddings + num_system * row, num_tokens * row * sizeof(float));
+        if (out_num_tokens) *out_num_tokens = num_tokens;
+        if (out_seq_len) *out_seq_len = num_tokens;
+    }
 
     return embeddings;
 }

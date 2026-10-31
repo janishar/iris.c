@@ -146,6 +146,11 @@ int iris_is_zimage(iris_ctx *ctx);
 int iris_is_flux3(iris_ctx *ctx);
 
 /*
+ * Check if model is Qwen-Image 2.1 (base or Turbo).
+ */
+int iris_is_qimage(iris_ctx *ctx);
+
+/*
  * Default number of steps and guidance scale for the loaded model.
  */
 int iris_default_steps(iris_ctx *ctx);

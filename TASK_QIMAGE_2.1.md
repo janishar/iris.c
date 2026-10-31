@@ -1,7 +1,66 @@
 # Task: add Qwen-Image 2.1 and Turbo support
 
-Status: planned, not started. No C code has been written. Delete this file
-when the work is merged.
+Status: implemented (M0 to M6, transformer device path included), verified
+against the official diffusers classes on tiny random-weight checkpoints.
+Not yet run on the real weights: that is the remaining work, listed in
+"Remaining work" below. Delete this file when the work is merged.
+
+## Implementation status
+
+What exists:
+
+| Milestone | Where |
+|---|---|
+| M0 reference | `debug/qimage_reference.py` (`--emb`, `--noise`, `--decode`, `--blocks`), `debug/dump_noise.c` |
+| M1 detection, scheduler | `iris_load_dir` (`QwenImage21Pipeline`, `sample_sigmas`, `context_in_dim`), `iris_qimage_sched_load` / `iris_schedule_qimage` in iris_sample.c |
+| M2 text encoder | `QWEN3_EXTRACT_QIMAGE`, `qwen3_tokenize_chat_system` (system block, drop index, tail-preserving truncation), `processor/tokenizer.json`, single `model.safetensors` |
+| M3 transformer CPU | `iris_transformer_qimage.c` (prefill once, image-only steps) |
+| M4 transformer device | same file under `IRIS_DEV`; new `iris_dev_copy_2d` in iris_cuda.cu and iris_dev_metal.m |
+| M5 VAE decoder | `iris_vae_qimage.c` (CPU, BLAS) |
+| M6 plumbing | iris.c routing, iris_cli.c, main.c help, Makefile, download scripts, run_test.py smoke test, README, CLAUDE.md |
+
+Verified in a Linux session without the real weights. Tiny checkpoints were
+built with the upstream classes (2 blocks, head_dim 32; VAE with the real
+`dim_mult` pattern at base width 8; all weights random, norms included).
+Results:
+
+| Check | Result |
+|---|---|
+| Scheduler (dynamic shift + terminal stretch) | max abs diff 1.2e-7 |
+| Transformer velocities, steps 0 and 1, BLAS and generic | relative L2 4.5e-6 / 1.2e-6 |
+| Prefix reuse across forward calls | included in the step 1 check |
+| Transformer device path (CPU emulation of iris_dev.h) | relative L2 0.8% (upstream itself in bf16: 1.2%) |
+| VAE decode of the reference latent | max 1/255, one pixel |
+| `./iris -e emb.bin --noise noise.bin` vs reference PNG, base 3 steps, Turbo 8 steps, 160x96 | max 1/255, mean < 0.001 |
+| Weight names and shapes | match the upstream safetensors |
+| `download_model.sh qimage-turbo` file selection | checked with a stub curl |
+
+Not verified here: the text encoder (no Qwen3-VL tokenizer or weights;
+`tokens.txt` and `drop_idx.txt` decide it), the real configs, CUDA and Metal
+compilation of `iris_dev_copy_2d` (no toolchains), and performance.
+
+## Remaining work
+
+On the Mac, in this order:
+
+1. `make mps` and `make blas`; `make test` (FLUX.3 must match its baseline).
+2. Noise for seed 42 at 256x256:
+   `make lib && cc -O2 -I. -o /tmp/dump_noise debug/dump_noise.c libiris.a -lm -framework Accelerate`,
+   then `/tmp/dump_noise 64 16 16 42 /tmp/noise.bin`.
+3. Reference on Turbo: `python debug/qimage_reference.py -d ~/GenAI/models/Qwen-Image-2.1-Turbo
+   -p "A fluffy orange cat sitting on a windowsill" -W 256 -H 256 --noise /tmp/noise.bin
+   --blocks -o /tmp/qref`. Check that the printed scheduler config is as expected.
+4. Text encoder: `/tmp/dump_emb MODEL "A fluffy orange cat sitting on a windowsill"
+   /tmp/emb_c.bin` (build line in `debug/dump_emb.c`, BLAS build) and compare
+   with `/tmp/qref/emb.bin`; its row count must be `len(tokens.txt) - drop_idx`.
+   If it differs, compare the token ids first.
+5. Transformer and VAE without the encoder:
+   `./iris -d MODEL -e /tmp/qref/emb.bin --noise /tmp/noise.bin -W 256 -H 256 -o /tmp/q.png`,
+   compared with `/tmp/qref/image.png`, on the BLAS and the MPS build.
+6. Full prompt runs at 1024x1024 for Turbo and base; then add a reference
+   test vector to `run_test.py` (replacing the smoke test's size check).
+7. Optional: a device path for the VAE decoder (needed for speed on CUDA
+   builds without OpenBLAS; new kernels: per-pixel RMS norm, DupUp).
 
 ## Goal
 
@@ -69,7 +128,7 @@ Check these before relying on them:
   block reads 288 ch at 1024x1024, which is 1.2 GB per buffer. At 2048 that is
   4x, so VAE memory, not the transformer, limits the maximum size.
 
-## Order of work
+## Order of work (original plan; the acceptance criteria apply to the real-weight runs)
 
 Work one component at a time, in one checkout. Parity runs load tens of GB and
 all builds share the same object files, so parallel builds or model runs will

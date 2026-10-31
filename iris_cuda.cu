@@ -225,6 +225,13 @@ extern "C" void iris_dev_download(void *dst, const void *src, size_t bytes) {
     check(GPU(StreamSynchronize)(g_stream), "sync");
 }
 
+extern "C" void iris_dev_copy_2d(uint16_t *dst, int ldd, const uint16_t *src, int lds,
+                                 int rows, int cols) {
+    if (rows && cols)
+        check(GPU(Memcpy2DAsync)(dst, (size_t)ldd * 2, src, (size_t)lds * 2, (size_t)cols * 2,
+                                 rows, GPU(MemcpyDeviceToDevice), g_stream), "copy");
+}
+
 extern "C" void iris_dev_sync(void) {
     check(GPU(StreamSynchronize)(g_stream), "sync");
 }
