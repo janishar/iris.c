@@ -22,7 +22,7 @@ LIB = libiris.a
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug lib install info test pngtest help generic blas mps cuda rocm
+.PHONY: all clean debug lib install info test pngtest tokenizertest help generic blas mps cuda rocm
 .NOTPARALLEL: mps
 
 # Default: show available targets
@@ -46,6 +46,7 @@ endif
 	@echo "  make clean    - Remove build artifacts"
 	@echo "  make test     - Run inference test"
 	@echo "  make pngtest  - Compare PNG load on compressed image"
+	@echo "  make tokenizertest TOKENIZER=<tokenizer.json> - Check prompt truncation"
 	@echo "  make info     - Show build configuration"
 	@echo "  make lib      - Build static library"
 	@echo ""
@@ -178,6 +179,12 @@ pngtest:
 	@/tmp/iris_png_compare images/cat_uncompressed.png images/cat_compressed.png
 	@rm -f /tmp/iris_png_compare
 	@echo "PNG TEST PASSED"
+
+tokenizertest:
+	@$(CC) $(CFLAGS_BASE) -I. qwen3_tokenizer_test.c iris_qwen3_tokenizer.c -lm -o iris_tokenizer_test
+	@out=$$(./iris_tokenizer_test $(TOKENIZER) 2>&1); rc=$$?; rm -f iris_tokenizer_test; \
+	 test $$rc = 0 && test "$$(echo "$$out" | grep -c 'prompt truncated from')" = 1
+	@echo "TOKENIZER TEST PASSED"
 
 install: $(TARGET) $(LIB)
 	install -d /usr/local/bin

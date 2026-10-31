@@ -10,6 +10,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdint.h>
+#include <limits.h>
 #include "iris_kernels.h"
 
 /* ========================================================================
@@ -991,6 +992,11 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
                          int *num_tokens, int max_len, int skip_think_tags) {
     if (max_len <= 0) max_len = QWEN3_MAX_SEQ_LEN;
 
+    /* Tokenize everything and cut at the end, so a truncation can say how
+     * many tokens were lost. */
+    int limit = max_len;
+    max_len = INT_MAX;
+
     int capacity = 256;
     int *tokens = malloc(capacity * sizeof(int));
     int total = 0;
@@ -1096,6 +1102,13 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
             tokens[total++] = think_newlines[i];
         }
         free(think_newlines);
+    }
+
+    if (total > limit) {
+        /* Leading newline: the one-shot CLI is mid-line on "Encoding text...". */
+        fprintf(stderr, "\nWarning: prompt truncated from %d to %d tokens "
+                "(text encoder limit)\n", total, limit);
+        total = limit;
     }
 
     *num_tokens = total;

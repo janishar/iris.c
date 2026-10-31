@@ -313,21 +313,48 @@ static void cli_substep_progress(iris_substep_type_t type, int index, int total)
     fflush(stderr);
 }
 
+/* Same text as the one-shot CLI, but the start line ends in a newline so
+ * a program reading a pipe sees a phase as it begins. */
+static void cli_phase_progress(const char *phase, int done) {
+    static struct timespec phase_start;
+    struct timespec now;
+    char display[64];
+
+    if (cli_progress_phase != PROG_NONE) fprintf(stderr, "\n");
+    cli_progress_phase = PROG_NONE;
+
+    snprintf(display, sizeof(display), "%s", phase);
+    display[0] = toupper((unsigned char)display[0]);
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (!done) {
+        phase_start = now;
+        fprintf(stderr, "%s...\n", display);
+    } else {
+        double elapsed = (now.tv_sec - phase_start.tv_sec) +
+                         (now.tv_nsec - phase_start.tv_nsec) / 1e9;
+        fprintf(stderr, "%s... done (%.1fs)\n", display, elapsed);
+    }
+    fflush(stderr);
+}
+
 static void cli_progress_start(void) {
     cli_progress_phase = PROG_NONE;
     iris_text_progress_callback = cli_text_progress;
     iris_vae_progress_callback = cli_vae_progress;
     iris_step_callback = cli_step_progress;
     iris_substep_callback = cli_substep_progress;
+    iris_phase_callback = cli_phase_progress;
 }
 
 static void cli_progress_end(void) {
-    fprintf(stderr, "\n");
+    if (cli_progress_phase != PROG_NONE) fprintf(stderr, "\n");
     cli_progress_phase = PROG_NONE;
     iris_text_progress_callback = NULL;
     iris_vae_progress_callback = NULL;
     iris_step_callback = NULL;
     iris_substep_callback = NULL;
+    iris_phase_callback = NULL;
 }
 
 /* In interactive mode we reuse the same process/context across generations.
@@ -390,15 +417,17 @@ static int generate_image(const char *prompt, const char *ref_image,
     /* Generate */
     iris_image *img = NULL;
     if (ref_image) {
-        /* Use explicit size if provided, otherwise use reference image dimensions */
+        /* Use explicit size if provided, otherwise the library sizes the
+         * output from the reference image */
         if (explicit_width > 0 && explicit_height > 0) {
             params.width = explicit_width;
             params.height = explicit_height;
+            printf("Generating %dx%d (img2img)...\n", params.width, params.height);
         } else {
-            params.width = ref->width;
-            params.height = ref->height;
+            params.width = 0;
+            params.height = 0;
+            printf("Generating at reference size (img2img)...\n");
         }
-        printf("Generating %dx%d (img2img)...\n", params.width, params.height);
         img = iris_img2img(state.ctx, prompt, ref, &params);
     } else {
         /* Text-to-image: use explicit size if provided, otherwise state defaults */
@@ -520,17 +549,18 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
         }
     }
 
-    /* Use explicit size if provided, otherwise default to first reference image */
+    /* Use explicit size if provided, otherwise the library sizes the output
+     * from the first reference image */
     if (explicit_width > 0 && explicit_height > 0) {
         params.width = explicit_width;
         params.height = explicit_height;
+        printf("Generating %dx%d (multi-ref, %d images)...\n",
+               params.width, params.height, num_refs);
     } else {
-        params.width = refs[0]->width;
-        params.height = refs[0]->height;
+        params.width = 0;
+        params.height = 0;
+        printf("Generating at reference size (multi-ref, %d images)...\n", num_refs);
     }
-
-    printf("Generating %dx%d (multi-ref, %d images)...\n",
-           params.width, params.height, num_refs);
 
     cli_prepare_next_generation();
     cli_progress_start();
