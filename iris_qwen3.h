@@ -47,6 +47,15 @@ extern "C" {
 typedef struct qwen3_model qwen3_model_t;
 typedef struct qwen3_tokenizer qwen3_tokenizer_t;
 
+#define QWEN3_VISION_DEEPSTACK 3
+
+/* Vision tower output of one image, on its grid of h x w merged blocks. */
+typedef struct {
+    int h, w;
+    const float *embeds;                        /* [h * w, hidden] */
+    const float *deep[QWEN3_VISION_DEEPSTACK];  /* [h * w, hidden] each */
+} qwen3_image_t;
+
 /* ========================================================================
  * Tokenizer API
  * ======================================================================== */
@@ -77,6 +86,16 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
 int *qwen3_tokenize_chat_system(qwen3_tokenizer_t *tok, const char *system,
                                 const char *prompt, int *num_tokens,
                                 int *num_system, int max_len);
+
+/*
+ * Same template with images in front of the prompt (Qwen-Image references):
+ * <|im_start|>user\n<image1><|vision_start|>{pad * slots[0]}<|vision_end|>
+ * then " <image2>..." for later images, then the prompt. image_rows[i]
+ * receives the first pad row of image i.
+ */
+int *qwen3_tokenize_chat_images(qwen3_tokenizer_t *tok, const char *system,
+                                const char *prompt, const int *slots, int n,
+                                int *num_tokens, int *num_system, int *image_rows);
 
 /*
  * Pad tokens to max_len with PAD token.
@@ -180,6 +199,16 @@ float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
                               int *out_num_tokens, int *out_seq_len);
 
 /*
+ * Encode a Qwen-Image prompt with n reference images, in
+ * QWEN3_EXTRACT_QIMAGE mode. Returns the text rows [*out_seq, hidden] without
+ * the image slots (caller frees); pos[i] receives the number of text rows
+ * before image i. Returns NULL above the encoder's token limit.
+ */
+float *qwen3_encode_images(qwen3_encoder_t *enc, const char *prompt,
+                           const qwen3_image_t *images, int n,
+                           int *out_seq, int *pos);
+
+/*
  * Open the safetensors shards of model_dir (index, or a single file).
  * Returns the number of files opened, 0 on failure.
  */
@@ -189,8 +218,6 @@ int open_safetensors_shards(const char *model_dir,
 /* ========================================================================
  * Vision Tower (Qwen3-VL, iris_qwen3_vision.c)
  * ======================================================================== */
-
-#define QWEN3_VISION_DEEPSTACK 3
 
 typedef struct qwen3_vision qwen3_vision_t;
 

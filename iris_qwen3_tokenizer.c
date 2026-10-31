@@ -25,6 +25,9 @@
 /* Special token IDs */
 #define QWEN3_PAD_ID 151643      /* <|endoftext|> */
 #define QWEN3_IM_START_ID 151644 /* <|im_start|> */
+#define QWEN3_VISION_START_ID 151652 /* <|vision_start|> */
+#define QWEN3_VISION_END_ID 151653   /* <|vision_end|> */
+#define QWEN3_IMAGE_PAD_ID 151655    /* <|image_pad|> */
 #define QWEN3_IM_END_ID 151645   /* <|im_end|> */
 #define QWEN3_THINK_START_ID 151667 /* <think> */
 #define QWEN3_THINK_END_ID 151668   /* </think> */
@@ -1182,6 +1185,61 @@ int *qwen3_tokenize_chat_system(qwen3_tokenizer_t *tok, const char *system,
 
     free(sys_ids);
     free(user_ids);
+    free(nl_ids);
+    free(asst_ids);
+    *num_tokens = total;
+    return tokens;
+}
+
+/* qwen3_tokenize_chat_system with images in the user turn. Each piece between
+ * special tokens is tokenized on its own, <imageN> is literal text and the
+ * prompt no longer joins the role header. */
+int *qwen3_tokenize_chat_images(qwen3_tokenizer_t *tok, const char *system,
+                                const char *prompt, const int *slots, int n,
+                                int *num_tokens, int *num_system, int *image_rows) {
+    static const int im_start = QWEN3_IM_START_ID, im_end = QWEN3_IM_END_ID;
+    static const int vision_start = QWEN3_VISION_START_ID, vision_end = QWEN3_VISION_END_ID;
+    static const int image_pad = QWEN3_IMAGE_PAD_ID;
+    if (!prompt[0]) prompt = " ";
+
+    char *sys_text = malloc(strlen(system) + 8);
+    sprintf(sys_text, "system\n%s", system);
+    int n_sys, n_prompt, n_nl, n_asst;
+    int *sys_ids = qwen3_tokenize(tok, sys_text, &n_sys, INT_MAX);
+    int *prompt_ids = qwen3_tokenize(tok, prompt, &n_prompt, INT_MAX);
+    int *nl_ids = qwen3_tokenize(tok, "\n", &n_nl, INT_MAX);
+    int *asst_ids = qwen3_tokenize(tok, "assistant\n", &n_asst, INT_MAX);
+    free(sys_text);
+
+    int capacity = 256, total = 0;
+    int *tokens = malloc(capacity * sizeof(int));
+    tokens = append_tokens(tokens, &total, &capacity, &im_start, 1);
+    tokens = append_tokens(tokens, &total, &capacity, sys_ids, n_sys);
+    tokens = append_tokens(tokens, &total, &capacity, &im_end, 1);
+    tokens = append_tokens(tokens, &total, &capacity, nl_ids, n_nl);
+    *num_system = total;
+    tokens = append_tokens(tokens, &total, &capacity, &im_start, 1);
+    for (int i = 0; i < n; i++) {
+        char label[32];
+        int n_label;
+        snprintf(label, sizeof(label), "%s<image%d>", i ? " " : "user\n", i + 1);
+        int *label_ids = qwen3_tokenize(tok, label, &n_label, INT_MAX);
+        tokens = append_tokens(tokens, &total, &capacity, label_ids, n_label);
+        free(label_ids);
+        tokens = append_tokens(tokens, &total, &capacity, &vision_start, 1);
+        image_rows[i] = total;
+        for (int s = 0; s < slots[i]; s++)
+            tokens = append_tokens(tokens, &total, &capacity, &image_pad, 1);
+        tokens = append_tokens(tokens, &total, &capacity, &vision_end, 1);
+    }
+    tokens = append_tokens(tokens, &total, &capacity, prompt_ids, n_prompt);
+    tokens = append_tokens(tokens, &total, &capacity, &im_end, 1);
+    tokens = append_tokens(tokens, &total, &capacity, nl_ids, n_nl);
+    tokens = append_tokens(tokens, &total, &capacity, &im_start, 1);
+    tokens = append_tokens(tokens, &total, &capacity, asst_ids, n_asst);
+
+    free(sys_ids);
+    free(prompt_ids);
     free(nl_ids);
     free(asst_ids);
     *num_tokens = total;

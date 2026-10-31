@@ -113,6 +113,12 @@ struct qwen3_model {
     /* RoPE tables, filled for each forward pass */
     float *rope_cos;          /* [max_seq_len, head_dim/2] */
     float *rope_sin;          /* [max_seq_len, head_dim/2] */
+    int mrope_h, mrope_w;     /* mrope_section[1..2], 0 without one */
+
+    /* Images of the prompt being encoded (Qwen-Image references) */
+    const qwen3_image_t *images;
+    const int *image_rows;    /* first slot row of each image */
+    int num_images;
 
     /* Working memory */
     float *hidden_state;      /* [seq_len, hidden] */
@@ -270,23 +276,55 @@ static void qwen3_softmax(float *x, int len) {
  * RoPE (Rotary Position Embedding)
  * ======================================================================== */
 
-/* Fill the RoPE tables for one forward pass. Token s sits at position s,
- * except in Flux3 mode, where padding tokens sit at position 1: that is
- * what the transformers version Flux3 was trained with assigns them, and
- * the Flux3 transformer attends to the padding embeddings. */
+/* One row of the RoPE tables at multi-axis position (t, h, w). Interleaved
+ * MRoPE: every third of the first 3 * mrope_h frequencies follows the height,
+ * the next one of the first 3 * mrope_w the width, the others the frame. */
+static void qwen3_rope_row(qwen3_model_t *model, int s, int t, int h, int w) {
+    int half_dim = model->head_dim / 2;
+    for (int i = 0; i < half_dim; i++) {
+        float freq = 1.0f / powf(model->rope_theta, (float)(2 * i) / model->head_dim);
+        int pos = (i % 3 == 1 && i < 3 * model->mrope_h) ? h :
+                  (i % 3 == 2 && i < 3 * model->mrope_w) ? w : t;
+        float angle = pos * freq;
+        model->rope_cos[s * half_dim + i] = cosf(angle);
+        model->rope_sin[s * half_dim + i] = sinf(angle);
+    }
+}
+
+/* Fill the RoPE tables for one forward pass. Tokens sit at consecutive
+ * positions on all axes, with two exceptions. In Flux3 mode padding tokens
+ * sit at position 1: that is what the transformers version Flux3 was trained
+ * with assigns them, and the Flux3 transformer attends to the padding
+ * embeddings. The h x w slots of an image sit at (p, p + row, p + col), and
+ * the positions after it continue at p + max(h, w). */
 static void qwen3_set_rope_positions(qwen3_model_t *model,
                                      const int *attention_mask, int seq_len) {
-    int half_dim = model->head_dim / 2;
     int pad_at_one = model->extraction_mode == QWEN3_EXTRACT_FLUX3 && attention_mask;
+    int p = 0, next = 0;
 
-    for (int s = 0; s < seq_len; s++) {
-        int pos = (pad_at_one && !attention_mask[s]) ? 1 : s;
-        for (int i = 0; i < half_dim; i++) {
-            float freq = 1.0f / powf(model->rope_theta, (float)(2 * i) / model->head_dim);
-            float angle = pos * freq;
-            model->rope_cos[s * half_dim + i] = cosf(angle);
-            model->rope_sin[s * half_dim + i] = sinf(angle);
+    for (int s = 0; s < seq_len;) {
+        if (next < model->num_images && s == model->image_rows[next]) {
+            const qwen3_image_t *img = &model->images[next++];
+            for (int r = 0; r < img->h; r++)
+                for (int c = 0; c < img->w; c++)
+                    qwen3_rope_row(model, s++, p, p + r, p + c);
+            p += img->h > img->w ? img->h : img->w;
+        } else {
+            int pos = (pad_at_one && !attention_mask[s]) ? 1 : p;
+            qwen3_rope_row(model, s++, pos, pos, pos);
+            p++;
         }
+    }
+}
+
+/* Add deepstack feature k at the image rows of x [seq, hidden]. */
+static void qwen3_add_deepstack(const qwen3_model_t *model, float *x, int k) {
+    size_t hidden = model->hidden_size;
+    for (int i = 0; i < model->num_images; i++) {
+        const qwen3_image_t *img = &model->images[i];
+        float *row = x + model->image_rows[i] * hidden;
+        size_t n = (size_t)img->h * img->w * hidden;
+        for (size_t j = 0; j < n; j++) row[j] += img->deep[k][j];
     }
 }
 
@@ -302,6 +340,9 @@ static int qwen3_output_layers(const qwen3_model_t *model, int *layers) {
         for (int i = 0; i < 8; i++) layers[i] = 4 * (i + 1) - 1;
         return 8;
     case QWEN3_EXTRACT_QIMAGE:  /* last layer, before the final norm */
+#ifdef QWEN3_QIMAGE_OUTPUTS     /* debug/dump_qimage_text.c */
+        return QWEN3_QIMAGE_OUTPUTS(model, layers);
+#endif
         layers[0] = model->num_layers - 1;
         return 1;
     default:                    /* hidden_states[9, 18, 27] */
@@ -1047,6 +1088,19 @@ static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *atten
             free_layer_weights(layer);
         }
 
+        if (model->num_images && layer_idx < QWEN3_VISION_DEEPSTACK) {
+            float *deep = calloc((size_t)seq_len * hidden, sizeof(float));
+            iris_gpu_tensor_t t = NULL;
+            if (deep) {
+                qwen3_add_deepstack(model, deep, layer_idx);
+                t = f32_to_bf16_tensor(deep, seq_len * hidden);
+                free(deep);
+            }
+            if (!t) { ok = 0; break; }
+            iris_gpu_add_bf16(hidden_gpu, hidden_gpu, t, seq_len * hidden);
+            iris_gpu_tensor_free(t);
+        }
+
         /* Save output at extraction layers (GPU blit copy) */
         for (int i = 0; i < num_saved; i++)
             if (layer_idx == out_layers[i])
@@ -1126,6 +1180,11 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
             memset(model->hidden_state + s * hidden, 0, hidden * sizeof(float));
         }
     }
+    for (int i = 0; i < model->num_images; i++) {
+        const qwen3_image_t *img = &model->images[i];
+        memcpy(model->hidden_state + (size_t)model->image_rows[i] * hidden, img->embeds,
+               (size_t)img->h * img->w * hidden * sizeof(float));
+    }
 
     /* Run through transformer layers */
 #ifdef QWEN3_DEV
@@ -1187,6 +1246,9 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
         if (model->use_mmap) {
             free_layer_weights(&model->layers[layer_idx]);
         }
+
+        if (layer_idx < QWEN3_VISION_DEEPSTACK)
+            qwen3_add_deepstack(model, model->hidden_state, layer_idx);
 
         /* Save output at extraction layers */
         for (int i = 0; i < num_out; i++)
@@ -1607,6 +1669,15 @@ static int qwen3_forward_dev(qwen3_model_t *model, int seq_len, const int *atten
         iris_dev_linear_f32(d->out, d->act, dl->w_down, seq_len, inter, hidden);
         iris_dev_residual(d->x, d->out, NULL, seq_len, hidden);
 
+        if (model->num_images && l < QWEN3_VISION_DEEPSTACK) {
+            float *deep = calloc((size_t)seq_len * hidden, sizeof(float));
+            if (!deep) return 0;
+            qwen3_add_deepstack(model, deep, l);
+            iris_dev_upload(d->out, deep, (size_t)seq_len * hidden * sizeof(float));
+            free(deep);
+            iris_dev_residual(d->x, d->out, NULL, seq_len, hidden);
+        }
+
         for (int i = 0; i < num_out; i++)
             if (l == out_layers[i])
                 iris_dev_download(model->layer_outputs[i], d->x,
@@ -1666,6 +1737,11 @@ static int parse_qwen3_config(const char *model_dir, qwen3_model_t *model) {
     }
     if ((p = strstr(base, "\"rope_theta\""))) {
         if ((p = strchr(p, ':'))) rope_theta = atof(p + 1);
+    }
+    if ((p = strstr(base, "\"mrope_section\""))) {
+        int frame;
+        if ((p = strchr(p, '[')))
+            sscanf(p, "[ %d , %d , %d", &frame, &model->mrope_h, &model->mrope_w);
     }
 
     if (hidden <= 0 || num_heads <= 0) return -1;
@@ -2083,30 +2159,13 @@ void qwen3_encoder_free(qwen3_encoder_t *enc) {
     free(enc);
 }
 
-/* Main text encoding API. Tokenizes the prompt using Qwen3 chat template
- * (with <think> tags for Flux only, with a system message for Qwen-Image),
- * pads it (to 512 tokens, or for the Qwen3-VL models to the next multiple
- * of 80), runs the forward pass, and returns the extracted embeddings.
- * Also returns the number of real (non-padding) tokens via out_num_tokens,
- * which Z-Image needs for its unpadded attention over text tokens, and the
- * padded length via out_seq_len. Qwen-Image returns only the real tokens
- * after its system block, and both counts are that number. */
-float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
-                              int *out_num_tokens, int *out_seq_len) {
-    if (!enc || !enc->tokenizer || !enc->model || !prompt) return NULL;
-
+/* Pad tokens (freed here), run the forward pass and return the extracted
+ * embeddings. Qwen-Image keeps only the real tokens after its system block. */
+static float *qwen3_encode_tokens(qwen3_encoder_t *enc, int *tokens, int num_tokens,
+                                  int num_system, int *out_num_tokens, int *out_seq_len) {
     int mode = enc->model->extraction_mode;
     int vl = mode == QWEN3_EXTRACT_FLUX3 || mode == QWEN3_EXTRACT_QIMAGE;
     int max_len = vl ? enc->model->max_seq_len : QWEN3_MAX_SEQ_LEN;
-
-    /* Tokenize with chat template */
-    int num_tokens, num_system = 0;
-    int *tokens = (mode == QWEN3_EXTRACT_QIMAGE)
-        ? qwen3_tokenize_chat_system(enc->tokenizer, QWEN3_QIMAGE_SYSTEM, prompt,
-                                     &num_tokens, &num_system, max_len)
-        : qwen3_tokenize_chat(enc->tokenizer, prompt, &num_tokens,
-                              max_len, mode != QWEN3_EXTRACT_FLUX);
-    if (!tokens) return NULL;
 
     /* Qwen3-VL prompts pad to a multiple of 80. For Qwen-Image the padding
      * only follows the real tokens, which the causal encoder keeps
@@ -2147,6 +2206,80 @@ float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
     }
 
     return embeddings;
+}
+
+/* Main text encoding API. Tokenizes the prompt using Qwen3 chat template
+ * (with <think> tags for Flux only, with a system message for Qwen-Image),
+ * pads it (to 512 tokens, or for the Qwen3-VL models to the next multiple
+ * of 80), runs the forward pass, and returns the extracted embeddings.
+ * Also returns the number of real (non-padding) tokens via out_num_tokens,
+ * which Z-Image needs for its unpadded attention over text tokens, and the
+ * padded length via out_seq_len. Qwen-Image returns only the real tokens
+ * after its system block, and both counts are that number. */
+float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
+                              int *out_num_tokens, int *out_seq_len) {
+    if (!enc || !enc->tokenizer || !enc->model || !prompt) return NULL;
+
+    int mode = enc->model->extraction_mode;
+    int vl = mode == QWEN3_EXTRACT_FLUX3 || mode == QWEN3_EXTRACT_QIMAGE;
+    int max_len = vl ? enc->model->max_seq_len : QWEN3_MAX_SEQ_LEN;
+
+    /* Tokenize with chat template */
+    int num_tokens, num_system = 0;
+    int *tokens = (mode == QWEN3_EXTRACT_QIMAGE)
+        ? qwen3_tokenize_chat_system(enc->tokenizer, QWEN3_QIMAGE_SYSTEM, prompt,
+                                     &num_tokens, &num_system, max_len)
+        : qwen3_tokenize_chat(enc->tokenizer, prompt, &num_tokens,
+                              max_len, mode != QWEN3_EXTRACT_FLUX);
+    if (!tokens) return NULL;
+    return qwen3_encode_tokens(enc, tokens, num_tokens, num_system,
+                               out_num_tokens, out_seq_len);
+}
+
+float *qwen3_encode_images(qwen3_encoder_t *enc, const char *prompt,
+                           const qwen3_image_t *images, int n,
+                           int *out_seq, int *pos) {
+    qwen3_model_t *model = enc->model;
+    int *slots = malloc(n * sizeof(int)), *rows = malloc(n * sizeof(int));
+    int num_tokens, num_system, seq = 0;
+    float *emb = NULL;
+    if (slots && rows) {
+        for (int i = 0; i < n; i++) slots[i] = images[i].h * images[i].w;
+        int *tokens = qwen3_tokenize_chat_images(enc->tokenizer, QWEN3_QIMAGE_SYSTEM, prompt,
+                                                 slots, n, &num_tokens, &num_system, rows);
+        if (num_tokens > model->max_seq_len) {
+            fprintf(stderr, "Qwen3: the prompt with its images needs %d tokens, "
+                    "the limit is %d\n", num_tokens, model->max_seq_len);
+            free(tokens);
+        } else {
+            model->images = images;
+            model->image_rows = rows;
+            model->num_images = n;
+            emb = qwen3_encode_tokens(enc, tokens, num_tokens, num_system, NULL, &seq);
+            model->images = NULL;
+            model->image_rows = NULL;
+            model->num_images = 0;
+        }
+    }
+
+    /* The transformer fills the slots with image latents: drop them here. */
+    if (emb) {
+        size_t row = model->hidden_size;
+        int dst = 0, src = 0;
+        for (int i = 0; i <= n; i++) {
+            int end = i < n ? rows[i] - num_system : seq;
+            memmove(emb + dst * row, emb + src * row, (size_t)(end - src) * row * sizeof(float));
+            dst += end - src;
+            if (i < n) {
+                pos[i] = dst;
+                src = end + slots[i];
+            }
+        }
+        *out_seq = dst;
+    }
+    free(slots);
+    free(rows);
+    return emb;
 }
 
 float *qwen3_encode_text(qwen3_encoder_t *enc, const char *prompt) {
