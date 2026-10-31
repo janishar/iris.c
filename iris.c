@@ -1278,7 +1278,8 @@ static iris_image *iris_generate_qimage_with_embeddings(iris_ctx *ctx,
     }
 
     if (iris_phase_callback) iris_phase_callback("processing prompt", 0);
-    int ok = iris_transformer_prefill_qimage(ctx->qimage_transformer, text_emb, text_seq);
+    int ok = iris_transformer_prefill_qimage(ctx->qimage_transformer, text_emb, text_seq,
+                                             NULL, 0);
     if (iris_phase_callback) iris_phase_callback("processing prompt", 1);
     if (!ok) {
         set_error("Qwen-Image text prefill failed");

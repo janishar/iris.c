@@ -2,27 +2,30 @@
  * Qwen-Image 2.1 Transformer Implementation
  *
  * Implements QwenImage21Transformer2DModel (about 7B parameters):
- * - Single-stream blocks over the joint sequence [TEXT | IMAGE]. Image
- *   tokens are the unpatched latent pixels (64 channels) in raster order.
+ * - Single-stream blocks over the joint sequence: text rows with the
+ *   reference images interleaved at their prompt slots, then the target
+ *   image. Image tokens are the unpatched latent pixels (64 channels) in
+ *   raster order.
  * - Block: x += tanh(gate1) * attn(LN(x) * (1 + scale1)), then
  *          x += tanh(gate2) * mlp(LN(x) * (1 + scale2)).
  *   LayerNorm has no affine part and the modulation no shift. The MLP is
  *   out(silu(gate_layer(n)) * proj(n)).
  * - One modulation projection shared by all blocks: [scale1, gate1, scale2,
- *   gate2]. Text tokens are modulated from t = 0, image tokens from t.
- * - Block-causal attention: text is causal, image tokens see all text and
- *   all image tokens. Separate to_q/k/v, per-head RMSNorm on Q and K.
+ *   gate2]. The target is modulated from t, everything else from t = 0.
+ * - Block-causal attention: the sequence is causal, except that an image
+ *   block sees all of itself. Separate to_q/k/v, per-head RMSNorm on Q and K.
  * - 3-axis RoPE (frame, height, width; 16 + 56 + 56 dims, theta 10000),
- *   consecutive pairs. Text token i sits at (i, i, i); image token (r, c)
- *   at (T, r - (H - H/2), c - (W - W/2)) with T the text length.
+ *   consecutive pairs. A position p starts at 0. Text sits at (p, p, p),
+ *   p++; image token (r, c) at (p, r - (H - H/2), c - (W - W/2)), and
+ *   p += max(H, W) after the block.
  * - Text input: zero-centered RMSNorm (weight + 1), linear, GELU-tanh,
  *   linear. Output: LN(x) * (1 + scale) (no shift), projection to 64.
  *
- * Text never attends to the image and its modulation does not depend on
- * the step, so its keys and values are computed once per prompt (the
- * prefill) and every denoising step runs only the image tokens against
- * them. That is the reference pipeline's KV cache, filled before the
- * first step instead of during it.
+ * The prefix (text and references) never attends to the target and its
+ * modulation does not depend on the step, so its keys and values are
+ * computed once (the prefill) and every denoising step runs only the
+ * target tokens against them. That is the reference pipeline's KV cache,
+ * filled before the first step instead of during it.
  *
  * Weights stay as bf16 in the mmapped safetensors files. The CPU path
  * converts each matrix to f32 right before its matmul. With a device
@@ -56,6 +59,12 @@
 #define QI_T_CHANNELS   256   /* Sinusoidal timestep embedding size */
 #define QI_ROPE_THETA   10000.0f
 #define QI_ATTN_QCHUNK  256   /* Queries per attention chunk (CPU path) */
+
+/* Called after every block with its output; debug/dump_qimage_refs.c
+ * compares it with the reference. */
+#ifndef QI_BLOCK_HOOK
+#define QI_BLOCK_HOOK(tf, x, rows)
+#endif
 
 /* ========================================================================
  * Data Structures
@@ -97,10 +106,12 @@ struct iris_transformer_qimage {
     safetensors_file_t *sf[QI_MAX_SHARDS];
     int num_sf;
 
-    /* Text prefix from the last prefill */
-    int txt_seq;
-    float *txt_copy;        /* [txt_seq, text_dim], to recognize a repeated prompt */
-    float *prefix_kv;       /* CPU: [num_layers][2][txt_seq][dim], post-RoPE K, then V */
+    /* Prefix from the last prefill */
+    int prefix_seq;         /* Rows: text and references, 0 = none */
+    int target_frame;       /* Frame position of the target */
+    char *prefix_key;       /* The prefill's inputs, to recognize a repeat */
+    size_t prefix_key_bytes;
+    float *prefix_kv;       /* CPU: [num_layers][2][prefix_seq][dim], post-RoPE K, then V */
 
     /* Device copy of the model (GPU path), NULL when running on the CPU */
     struct qi_dev *dev;
@@ -191,7 +202,7 @@ static void apply_rope(float *x, const float *cos_t, const float *sin_t,
 }
 
 /* Attention of seq_q queries over seq_k keys, all [rows, heads * head_dim].
- * causal (seq_q == seq_k): query i only sees keys j <= i. Processed per
+ * causal: 0 = all keys, n > 0 = query i sees keys j < i + n. Processed per
  * head in chunks of queries to bound the score buffer [QCHUNK, seq_k]. */
 static void attention(float *out, const float *q, const float *k, const float *v,
                       float *scores, int seq_q, int seq_k, int heads, int head_dim,
@@ -222,7 +233,7 @@ static void attention(float *out, const float *q, const float *k, const float *v
 #endif
             if (causal)
                 for (int i = 0; i < nq; i++)
-                    for (int j = q0 + i + 1; j < seq_k; j++)
+                    for (int j = q0 + i + causal; j < seq_k; j++)
                         scores[(size_t)i * seq_k + j] = -1e30f;  /* not -INFINITY: -ffast-math */
             iris_softmax(scores, nq, seq_k);
 #ifdef USE_BLAS
@@ -320,30 +331,73 @@ static void rope_rows(const iris_transformer_qimage_t *tf, float *cos_t, float *
     }
 }
 
-/* RoPE tables of the text tokens: token i at (i, i, i). */
-static void text_rope(const iris_transformer_qimage_t *tf, int txt_seq,
-                      float *cos_t, float *sin_t) {
-    int (*pos)[QI_ROPE_AXES] = malloc((size_t)txt_seq * sizeof(*pos));
-    for (int s = 0; s < txt_seq; s++) pos[s][0] = pos[s][1] = pos[s][2] = s;
-    rope_rows(tf, cos_t, sin_t, (const int (*)[QI_ROPE_AXES])pos, txt_seq);
-    free(pos);
-}
-
-/* RoPE tables of an h x w image after txt_seq text tokens: the frame axis
- * stays at txt_seq, rows and columns are centred on zero. */
-static void image_rope(const iris_transformer_qimage_t *tf, int txt_seq, int h, int w,
-                       float *cos_t, float *sin_t) {
-    int (*pos)[QI_ROPE_AXES] = malloc((size_t)h * w * sizeof(*pos));
+/* Positions of an h x w image: the frame axis stays at frame, rows and
+ * columns are centred on zero. */
+static void image_positions(int (*pos)[QI_ROPE_AXES], int frame, int h, int w) {
     for (int r = 0; r < h; r++) {
         for (int c = 0; c < w; c++) {
             int *p = pos[r * w + c];
-            p[0] = txt_seq;
+            p[0] = frame;
             p[1] = r - (h - h / 2);
             p[2] = c - (w - w / 2);
         }
     }
+}
+
+/* RoPE tables of the target, an h x w image at frame. */
+static void image_rope(const iris_transformer_qimage_t *tf, int frame, int h, int w,
+                       float *cos_t, float *sin_t) {
+    int (*pos)[QI_ROPE_AXES] = malloc((size_t)h * w * sizeof(*pos));
+    image_positions(pos, frame, h, w);
     rope_rows(tf, cos_t, sin_t, (const int (*)[QI_ROPE_AXES])pos, h * w);
     free(pos);
+}
+
+/* ========================================================================
+ * Prefix Layout
+ * ======================================================================== */
+
+/* Queries [start, start + rows) over the first keys keys, with causal as in
+ * attention(). in: what the rows are made from, text rows [rows, text_dim]
+ * (causal) or a latent [channels, rows] (not causal). */
+typedef struct {
+    int start, rows, keys, causal;
+    const float *in;
+} qi_run_t;
+
+/* Lay the prefix out: at most 2n + 1 runs, where text sees everything
+ * before it and is causal over itself, and an image block sees everything
+ * before it and all of itself, and pos[rows][3], the positions of all its
+ * rows. Returns the frame position of the target. */
+static int prefix_layout(const iris_transformer_qimage_t *tf, qi_run_t *runs, int *nruns,
+                         int (*pos)[QI_ROPE_AXES], const float *txt, int txt_seq,
+                         const iris_qimage_ref_t *refs, int n) {
+    int count = 0, row = 0, t = 0, p = 0;
+    for (int i = 0; i <= n; i++) {
+        int end = i < n ? refs[i].pos : txt_seq;
+        if (end > t) {
+            int rows = end - t;
+            runs[count++] = (qi_run_t){row, rows, row + rows, row + 1,
+                                       txt + (size_t)t * tf->text_dim};
+            for (; t < end; t++, row++, p++) pos[row][0] = pos[row][1] = pos[row][2] = p;
+        }
+        if (i < n) {
+            int h = refs[i].h, w = refs[i].w;
+            runs[count++] = (qi_run_t){row, h * w, row + h * w, 0, refs[i].latent};
+            image_positions(pos + row, p, h, w);
+            row += h * w;
+            p += h > w ? h : w;
+        }
+    }
+    *nruns = count;
+    return p;
+}
+
+/* Latent [channels, n] -> tokens [n, channels]. */
+static void latent_tokens(float *tokens, const float *latent, int n, int channels) {
+    for (int c = 0; c < channels; c++)
+        for (int i = 0; i < n; i++)
+            tokens[(size_t)i * channels + c] = latent[(size_t)c * n + i];
 }
 
 /* ========================================================================
@@ -398,13 +452,15 @@ static void block_qkv(iris_transformer_qimage_t *tf, const qi_block_t *b, const 
     apply_rope(k, w->rope_cos, w->rope_sin, rows, tf->heads, tf->head_dim);
 }
 
-/* The rest of block b, after block_qkv(): attention of the rows over the
- * kv_rows keys in w->k / w->v, gated residual, then the gated MLP. */
+/* The rest of block b, after block_qkv(): the attention runs over the keys
+ * in w->k / w->v, gated residual, then the gated MLP. */
 static void block_finish(iris_transformer_qimage_t *tf, const qi_block_t *b, float *x,
-                         int rows, int kv_rows, const float *mod, int causal, qi_work_t *w) {
+                         int rows, const qi_run_t *runs, int nruns, const float *mod,
+                         qi_work_t *w) {
     int dim = tf->dim, mlp = tf->mlp;
-    attention(w->attn, w->q, w->k, w->v, w->scores, rows, kv_rows, tf->heads,
-              tf->head_dim, causal);
+    for (const qi_run_t *u = runs; u < runs + nruns; u++)
+        attention(w->attn + (size_t)u->start * dim, w->q + (size_t)u->start * dim, w->k, w->v,
+                  w->scores, u->rows, u->keys, tf->heads, tf->head_dim, u->causal);
     linear_bf16(tf, w->proj, w->attn, b->to_out, rows, dim, dim);
     gated_residual(x, w->proj, mod + dim, rows, dim);
 
@@ -415,6 +471,7 @@ static void block_finish(iris_transformer_qimage_t *tf, const qi_block_t *b, flo
         w->gate[i] = w->gate[i] / (1.0f + expf(-w->gate[i])) * w->up[i];
     linear_bf16(tf, w->proj, w->gate, b->mlp_out, rows, mlp, dim);
     gated_residual(x, w->proj, mod + 3 * dim, rows, dim);
+    QI_BLOCK_HOOK(tf, x, rows);
 }
 
 /* n = RMSNorm(txt) * (stored weight + 1), the text input norm. */
@@ -470,8 +527,8 @@ struct qi_dev {
     qi_dev_block_t *blocks;
     uint16_t *t_lin1, *t_lin2, *mod, *norm_out, *proj_out, *img_in, *txt_in1, *txt_in2;
 
-    /* Text prefix: per block the post-RoPE K | V rows [txt_seq, 2*dim] */
-    uint16_t *prefix;        /* [num_layers][txt_seq][2*dim] */
+    /* Prefix: per block the post-RoPE K | V rows */
+    uint16_t **prefix;       /* [num_layers], each [prefix_seq, 2*dim] */
 
     /* Activations for rows query tokens and kv_rows key tokens */
     int rows, kv_rows;
@@ -553,6 +610,13 @@ static void dev_free_activations(struct qi_dev *d) {
     d->rows = d->kv_rows = 0;
 }
 
+static void dev_free_prefix(iris_transformer_qimage_t *tf) {
+    for (int l = 0; l < tf->num_layers; l++) {
+        iris_dev_free(tf->dev->prefix[l]);
+        tf->dev->prefix[l] = NULL;
+    }
+}
+
 static void dev_free(iris_transformer_qimage_t *tf) {
     struct qi_dev *d = tf->dev;
     if (!d) return;
@@ -576,7 +640,10 @@ static void dev_free(iris_transformer_qimage_t *tf) {
     iris_dev_free(d->img_in);
     iris_dev_free(d->txt_in1);
     iris_dev_free(d->txt_in2);
-    iris_dev_free(d->prefix);
+    if (d->prefix) {
+        dev_free_prefix(tf);
+        free(d->prefix);
+    }
     dev_free_activations(d);
     iris_dev_free(d->in_f32);
     iris_dev_free(d->in_bf16);
@@ -607,7 +674,8 @@ static int dev_load(iris_transformer_qimage_t *tf) {
          d->txt_in1 && d->txt_in2;
 
     d->blocks = ok ? calloc(tf->num_layers, sizeof(qi_dev_block_t)) : NULL;
-    ok = ok && d->blocks;
+    d->prefix = ok ? calloc(tf->num_layers, sizeof(uint16_t *)) : NULL;
+    ok = ok && d->blocks && d->prefix;
     for (int l = 0; ok && l < tf->num_layers; l++) {
         const qi_block_t *b = &tf->blocks[l];
         qi_dev_block_t *db = &d->blocks[l];
@@ -733,16 +801,18 @@ static void dev_block_qkv(iris_transformer_qimage_t *tf, const qi_dev_block_t *b
                             tf->head_dim, tf->eps, 0);
 }
 
-/* Rest of the block: the rows (queries at row kv_off of dev->qkv) attend
- * to the first kv_rows keys, then the gated residual and the gated MLP. */
+/* Rest of the block: the attention runs (with the queries from row kv_off
+ * of dev->qkv), then the gated residual and the gated MLP. */
 static void dev_block_finish(iris_transformer_qimage_t *tf, const qi_dev_block_t *b,
-                             int rows, int kv_off, int kv_rows, int causal) {
+                             int rows, int kv_off, const qi_run_t *runs, int nruns) {
     struct qi_dev *d = tf->dev;
     int dim = tf->dim, mlp = tf->mlp, ld = 3 * dim, hd = tf->head_dim;
     const float *mod = d->vec + vec_layout(tf).mod;
-    iris_dev_attention(d->attn, dim, d->qkv + (size_t)kv_off * ld, d->qkv + dim,
-                       d->qkv + 2 * dim, ld, rows, kv_rows, tf->heads, tf->heads, hd,
-                       1.0f / sqrtf((float)hd), causal, NULL);
+    for (const qi_run_t *u = runs; u < runs + nruns; u++)
+        iris_dev_attention(d->attn + (size_t)u->start * dim, dim,
+                           d->qkv + (size_t)(kv_off + u->start) * ld, d->qkv + dim,
+                           d->qkv + 2 * dim, ld, u->rows, u->keys, tf->heads, tf->heads, hd,
+                           1.0f / sqrtf((float)hd), u->causal, NULL);
     iris_dev_linear_f32(d->out, d->attn, b->w_out, rows, dim, dim);
     iris_dev_residual(d->x, d->out, mod + dim, rows, dim);
 
@@ -751,55 +821,73 @@ static void dev_block_finish(iris_transformer_qimage_t *tf, const qi_dev_block_t
     iris_dev_swiglu(d->mlp_act, mlp, d->mlp_h, d->mlp_h + mlp, 2 * mlp, rows, mlp);
     iris_dev_linear_f32(d->out, d->mlp_act, b->w_mlp_out, rows, mlp, dim);
     iris_dev_residual(d->x, d->out, mod + 3 * dim, rows, dim);
+    QI_BLOCK_HOOK(tf, d->x, rows);
 }
 
-static int dev_prefill(iris_transformer_qimage_t *tf, const float *txt, int L) {
+/* Text input into y: norm and GELU on the host (once per prompt), the two
+ * projections on the device. */
+static void dev_text_in(iris_transformer_qimage_t *tf, float *y, const float *txt, int rows) {
     struct qi_dev *d = tf->dev;
-    int dim = tf->dim, half = tf->head_dim / 2;
+    int dim = tf->dim;
+    float *host = malloc((size_t)rows * (tf->text_dim > dim ? tf->text_dim : dim) * sizeof(float));
+    text_norm(tf, host, txt, rows);
+    dev_input_linear(tf, d->out, host, rows, tf->text_dim, d->txt_in1, dim);
+    iris_dev_download(host, d->out, (size_t)rows * dim * sizeof(float));
+    gelu_tanh(host, (size_t)rows * dim);
+    dev_input_linear(tf, y, host, rows, dim, d->txt_in2, dim);
+    free(host);
+}
+
+static int dev_prefill(iris_transformer_qimage_t *tf, const qi_run_t *runs, int nruns, int L,
+                       const float *rope_cos, const float *rope_sin) {
+    struct qi_dev *d = tf->dev;
+    int dim = tf->dim, half = tf->head_dim / 2, ch = tf->in_channels;
     size_t in_elems = (size_t)L * (tf->text_dim > dim ? tf->text_dim : dim);
-    iris_dev_free(d->prefix);
-    d->prefix = iris_dev_alloc((size_t)tf->num_layers * L * 2 * dim * sizeof(uint16_t));
-    if (!d->prefix || !dev_ensure(tf, L, L, in_elems)) {
-        fprintf(stderr, "Qwen-Image: GPU allocation failed for %d text tokens\n", L);
+    dev_free_prefix(tf);
+    int ok = dev_ensure(tf, L, L, in_elems);
+    for (int l = 0; ok && l < tf->num_layers; l++) {
+        d->prefix[l] = iris_dev_alloc((size_t)L * 2 * dim * sizeof(uint16_t));
+        ok = d->prefix[l] != NULL;
+    }
+    if (!ok) {
+        fprintf(stderr, "Qwen-Image: GPU allocation failed for %d prefix tokens\n", L);
         return 0;
     }
 
     dev_modulation(tf, 0.0f, 0);
 
-    /* Text input: norm and GELU on the host (once per prompt), the two
-     * projections on the device. */
-    float *host = malloc(in_elems * sizeof(float));
-    text_norm(tf, host, txt, L);
-    dev_input_linear(tf, d->out, host, L, tf->text_dim, d->txt_in1, dim);
-    iris_dev_download(host, d->out, (size_t)L * dim * sizeof(float));
-    gelu_tanh(host, (size_t)L * dim);
-    dev_input_linear(tf, d->x, host, L, dim, d->txt_in2, dim);
-    free(host);
+    float *tokens = malloc((size_t)L * ch * sizeof(float));
+    for (const qi_run_t *u = runs; u < runs + nruns; u++) {
+        float *y = d->x + (size_t)u->start * dim;
+        if (u->causal) {
+            dev_text_in(tf, y, u->in, u->rows);
+        } else {
+            latent_tokens(tokens, u->in, u->rows, ch);
+            dev_input_linear(tf, y, tokens, u->rows, ch, d->img_in, dim);
+        }
+    }
+    free(tokens);
 
-    float *rc = malloc((size_t)L * half * sizeof(float));
-    float *rs = malloc((size_t)L * half * sizeof(float));
-    text_rope(tf, L, rc, rs);
-    iris_dev_upload(d->rope_cos, rc, (size_t)L * half * sizeof(float));
-    iris_dev_upload(d->rope_sin, rs, (size_t)L * half * sizeof(float));
-    free(rc);
-    free(rs);
+    iris_dev_upload(d->rope_cos, rope_cos, (size_t)L * half * sizeof(float));
+    iris_dev_upload(d->rope_sin, rope_sin, (size_t)L * half * sizeof(float));
 
     for (int l = 0; l < tf->num_layers; l++) {
         const qi_dev_block_t *b = &d->blocks[l];
         dev_block_qkv(tf, b, L, 0);
-        iris_dev_copy_2d(d->prefix + (size_t)l * L * 2 * dim, 2 * dim, d->qkv + dim, 3 * dim,
-                         L, 2 * dim);
-        if (l + 1 < tf->num_layers) dev_block_finish(tf, b, L, 0, L, 1);
+        iris_dev_copy_2d(d->prefix[l], 2 * dim, d->qkv + dim, 3 * dim, L, 2 * dim);
+        if (l + 1 < tf->num_layers) dev_block_finish(tf, b, L, 0, runs, nruns);
     }
     iris_dev_sync();
+    dev_free_activations(d);
     return 1;
 }
 
 static float *dev_forward(iris_transformer_qimage_t *tf, const float *x_in, int h, int w,
                           float sigma) {
     struct qi_dev *d = tf->dev;
-    int dim = tf->dim, half = tf->head_dim / 2, L = tf->txt_seq, n = h * w;
+    int dim = tf->dim, half = tf->head_dim / 2, L = tf->prefix_seq, n = h * w;
     int ch = tf->in_channels, och = tf->out_channels;
+    qi_run_t run = {0, n, L + n, 0, NULL};
     if (!dev_ensure(tf, n, L + n, (size_t)n * ch)) {
         fprintf(stderr, "Qwen-Image: GPU allocation failed for %d tokens\n", n);
         return NULL;
@@ -808,14 +896,12 @@ static float *dev_forward(iris_transformer_qimage_t *tf, const float *x_in, int 
     dev_modulation(tf, sigma, 1);
 
     float *tokens = malloc((size_t)n * (ch > och ? ch : och) * sizeof(float));
-    for (int c = 0; c < ch; c++)
-        for (int i = 0; i < n; i++)
-            tokens[(size_t)i * ch + c] = x_in[(size_t)c * n + i];
+    latent_tokens(tokens, x_in, n, ch);
     dev_input_linear(tf, d->x, tokens, n, ch, d->img_in, dim);
 
     float *rc = malloc((size_t)n * half * sizeof(float));
     float *rs = malloc((size_t)n * half * sizeof(float));
-    image_rope(tf, L, h, w, rc, rs);
+    image_rope(tf, tf->target_frame, h, w, rc, rs);
     iris_dev_upload(d->rope_cos, rc, (size_t)n * half * sizeof(float));
     iris_dev_upload(d->rope_sin, rs, (size_t)n * half * sizeof(float));
     free(rc);
@@ -823,10 +909,9 @@ static float *dev_forward(iris_transformer_qimage_t *tf, const float *x_in, int 
 
     for (int l = 0; l < tf->num_layers; l++) {
         const qi_dev_block_t *b = &d->blocks[l];
-        iris_dev_copy_2d(d->qkv + dim, 3 * dim, d->prefix + (size_t)l * L * 2 * dim, 2 * dim,
-                         L, 2 * dim);
+        iris_dev_copy_2d(d->qkv + dim, 3 * dim, d->prefix[l], 2 * dim, L, 2 * dim);
         dev_block_qkv(tf, b, n, L);
-        dev_block_finish(tf, b, n, L, L + n, 0);
+        dev_block_finish(tf, b, n, L, &run, 1);
     }
 
     iris_dev_layer_norm_mod(d->norm, d->x, NULL, d->vec + vec_layout(tf).fin, n, dim, tf->eps);
@@ -846,23 +931,35 @@ static float *dev_forward(iris_transformer_qimage_t *tf, const float *x_in, int 
  * Prefill and Forward
  * ======================================================================== */
 
-static int cpu_prefill(iris_transformer_qimage_t *tf, const float *txt, int L) {
-    int dim = tf->dim;
+static int cpu_prefill(iris_transformer_qimage_t *tf, const qi_run_t *runs, int nruns, int L,
+                       float *rope_cos, float *rope_sin) {
+    int dim = tf->dim, ch = tf->in_channels;
     size_t ld = (size_t)L * dim;
     free(tf->prefix_kv);
     tf->prefix_kv = malloc((size_t)tf->num_layers * 2 * ld * sizeof(float));
     float *x = malloc(ld * sizeof(float));
     float *mod = malloc(4 * dim * sizeof(float));
+    float *tokens = malloc((size_t)L * ch * sizeof(float));
     qi_work_t w;
-    if (!tf->prefix_kv || !x || !mod || !ensure_work(tf, L, L, &w)) {
+    if (!tf->prefix_kv || !x || !mod || !tokens || !ensure_work(tf, L, L, &w)) {
         free(x);
         free(mod);
+        free(tokens);
         return 0;
     }
+    w.rope_cos = rope_cos;
+    w.rope_sin = rope_sin;
 
     modulation(tf, mod, NULL, 0.0f);
-    text_in(tf, x, txt, L);
-    text_rope(tf, L, w.rope_cos, w.rope_sin);
+    for (const qi_run_t *u = runs; u < runs + nruns; u++) {
+        float *y = x + (size_t)u->start * dim;
+        if (u->causal) {
+            text_in(tf, y, u->in, u->rows);
+        } else {
+            latent_tokens(tokens, u->in, u->rows, ch);
+            linear_bf16(tf, y, tokens, tf->img_in, u->rows, ch, dim);
+        }
+    }
 
     for (int l = 0; l < tf->num_layers; l++) {
         const qi_block_t *b = &tf->blocks[l];
@@ -870,49 +967,89 @@ static int cpu_prefill(iris_transformer_qimage_t *tf, const float *txt, int L) {
         float *kv = tf->prefix_kv + (size_t)l * 2 * ld;
         memcpy(kv, w.k, ld * sizeof(float));
         memcpy(kv + ld, w.v, ld * sizeof(float));
-        /* The last block's text output is never read. */
-        if (l + 1 < tf->num_layers) block_finish(tf, b, x, L, L, mod, 1, &w);
+        /* The last block's prefix output is never read. */
+        if (l + 1 < tf->num_layers) block_finish(tf, b, x, L, runs, nruns, mod, &w);
     }
 
     free(x);
     free(mod);
+    free(tokens);
     return 1;
 }
 
 int iris_transformer_prefill_qimage(iris_transformer_qimage_t *tf,
-                                    const float *txt, int txt_seq) {
-    size_t txt_elems = (size_t)txt_seq * tf->text_dim;
+                                    const float *txt, int txt_seq,
+                                    const iris_qimage_ref_t *refs, int n) {
     if (txt_seq <= 0) return 0;
-    if (tf->txt_seq == txt_seq && !memcmp(tf->txt_copy, txt, txt_elems * sizeof(float)))
-        return 1;  /* Same prompt: the prefix is still valid */
 
-    free(tf->txt_copy);
-    tf->txt_seq = 0;
-    tf->txt_copy = malloc(txt_elems * sizeof(float));
-    if (!tf->txt_copy) return 0;
-    memcpy(tf->txt_copy, txt, txt_elems * sizeof(float));
+    /* All the inputs, to recognize a repeat. */
+    size_t txt_bytes = (size_t)txt_seq * tf->text_dim * sizeof(float);
+    size_t key_bytes = txt_bytes;
+    int L = txt_seq, half = tf->head_dim / 2;
+    for (int i = 0; i < n; i++) {
+        size_t tokens = (size_t)refs[i].h * refs[i].w;
+        L += (int)tokens;
+        key_bytes += 3 * sizeof(int) + tokens * tf->in_channels * sizeof(float);
+    }
+    char *key = malloc(key_bytes);
+    if (!key) return 0;
+    memcpy(key, txt, txt_bytes);
+    char *kp = key + txt_bytes;
+    for (int i = 0; i < n; i++) {
+        size_t bytes = (size_t)refs[i].h * refs[i].w * tf->in_channels * sizeof(float);
+        int shape[3] = {refs[i].pos, refs[i].h, refs[i].w};
+        memcpy(kp, shape, sizeof(shape));
+        memcpy(kp + sizeof(shape), refs[i].latent, bytes);
+        kp += sizeof(shape) + bytes;
+    }
+    if (tf->prefix_seq && tf->prefix_key_bytes == key_bytes &&
+        !memcmp(tf->prefix_key, key, key_bytes)) {
+        free(key);
+        return 1;
+    }
+    free(tf->prefix_key);
+    tf->prefix_key = key;
+    tf->prefix_key_bytes = key_bytes;
+    tf->prefix_seq = 0;
 
-    int ok;
+    qi_run_t *runs = malloc((size_t)(2 * n + 1) * sizeof(qi_run_t));
+    int (*pos)[QI_ROPE_AXES] = malloc((size_t)L * sizeof(*pos));
+    float *rc = malloc((size_t)L * half * sizeof(float));
+    float *rs = malloc((size_t)L * half * sizeof(float));
+    int ok = runs && pos && rc && rs;
+    if (ok) {
+        int nruns;
+        int frame = prefix_layout(tf, runs, &nruns, pos, txt, txt_seq, refs, n);
+        rope_rows(tf, rc, rs, (const int (*)[QI_ROPE_AXES])pos, L);
 #ifdef IRIS_DEV
-    if (tf->dev) ok = dev_prefill(tf, txt, txt_seq);
-    else
+        if (tf->dev) ok = dev_prefill(tf, runs, nruns, L, rc, rs);
+        else
 #endif
-    ok = cpu_prefill(tf, txt, txt_seq);
-    if (ok) tf->txt_seq = txt_seq;
+        ok = cpu_prefill(tf, runs, nruns, L, rc, rs);
+        if (ok) {
+            tf->prefix_seq = L;
+            tf->target_frame = frame;
+        }
+    }
+    free(runs);
+    free(pos);
+    free(rc);
+    free(rs);
     return ok;
 }
 
 float *iris_transformer_forward_qimage(iris_transformer_qimage_t *tf,
                                        const float *x_in, int h, int w_lat, float sigma) {
-    if (tf->txt_seq <= 0) {
-        fprintf(stderr, "Qwen-Image: forward without a text prefix\n");
+    if (tf->prefix_seq <= 0) {
+        fprintf(stderr, "Qwen-Image: forward without a prefix\n");
         return NULL;
     }
 #ifdef IRIS_DEV
     if (tf->dev) return dev_forward(tf, x_in, h, w_lat, sigma);
 #endif
-    int dim = tf->dim, L = tf->txt_seq, n = h * w_lat;
+    int dim = tf->dim, L = tf->prefix_seq, n = h * w_lat;
     size_t ld = (size_t)L * dim;
+    qi_run_t run = {0, n, L + n, 0, NULL};
 
     qi_work_t w;
     if (!ensure_work(tf, n, L + n, &w)) return NULL;
@@ -924,12 +1061,9 @@ float *iris_transformer_forward_qimage(iris_transformer_qimage_t *tf,
     float *tokens = malloc((size_t)n * ch * sizeof(float));
     modulation(tf, mod, fin, sigma);
 
-    /* Latent [ch, n] -> tokens [n, ch] -> residual stream. */
-    for (int c = 0; c < tf->in_channels; c++)
-        for (int i = 0; i < n; i++)
-            tokens[(size_t)i * tf->in_channels + c] = x_in[(size_t)c * n + i];
+    latent_tokens(tokens, x_in, n, tf->in_channels);
     linear_bf16(tf, x, tokens, tf->img_in, n, tf->in_channels, dim);
-    image_rope(tf, L, h, w_lat, w.rope_cos, w.rope_sin);
+    image_rope(tf, tf->target_frame, h, w_lat, w.rope_cos, w.rope_sin);
 
     for (int l = 0; l < tf->num_layers; l++) {
         const qi_block_t *b = &tf->blocks[l];
@@ -937,7 +1071,7 @@ float *iris_transformer_forward_qimage(iris_transformer_qimage_t *tf,
         memcpy(w.k, kv, ld * sizeof(float));
         memcpy(w.v, kv + ld, ld * sizeof(float));
         block_qkv(tf, b, x, n, mod, L, &w);
-        block_finish(tf, b, x, n, L + n, mod, 0, &w);
+        block_finish(tf, b, x, n, &run, 1, mod, &w);
     }
 
     /* Output layer: LN(x) * (1 + scale), projection, back to [ch, n]. */
@@ -1180,7 +1314,7 @@ void iris_transformer_free_qimage(iris_transformer_qimage_t *tf) {
     }
     free(tf->txt_norm);
     for (int i = 0; i < tf->num_sf; i++) safetensors_close(tf->sf[i]);
-    free(tf->txt_copy);
+    free(tf->prefix_key);
     free(tf->prefix_kv);
     free(tf->wbuf);
     free(tf->work);

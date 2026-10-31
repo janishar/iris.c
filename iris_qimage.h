@@ -75,15 +75,25 @@ void iris_transformer_free_qimage(iris_transformer_qimage_t *tf);
 /* Latent channels the transformer reads and predicts (64). */
 int iris_transformer_channels_qimage(const iris_transformer_qimage_t *tf);
 
-/* Run the text tokens txt [txt_seq, context_in_dim] through every block
- * once and keep their keys and values. Text never attends to the image
- * and is modulated from t = 0, so this prefix serves every step (and
- * every generation with the same prompt). Returns 1 on success. */
-int iris_transformer_prefill_qimage(iris_transformer_qimage_t *tf,
-                                    const float *txt, int txt_seq);
+/* A reference image in the prefix: its latent tokens sit after the first
+ * pos text rows. latent: normalized [channels, h * w]. */
+typedef struct {
+    int pos;
+    int h, w;
+    const float *latent;
+} iris_qimage_ref_t;
 
-/* Velocity [channels, h * w] of the latent x [channels, h * w] at sigma,
- * attending to the prefix from the last prefill (caller frees). */
+/* Run the prefix through every block once and keep its keys and values:
+ * the text rows txt [txt_seq, context_in_dim] (without image slots) with
+ * the n reference images interleaved. The prefix never attends to the
+ * target and is modulated from t = 0, so it serves every step (and every
+ * generation with the same inputs). Returns 1 on success. */
+int iris_transformer_prefill_qimage(iris_transformer_qimage_t *tf,
+                                    const float *txt, int txt_seq,
+                                    const iris_qimage_ref_t *refs, int n);
+
+/* Velocity [channels, h * w] of the target latent x [channels, h * w] at
+ * sigma, attending to the prefix from the last prefill (caller frees). */
 float *iris_transformer_forward_qimage(iris_transformer_qimage_t *tf,
                                        const float *x, int h, int w, float sigma);
 

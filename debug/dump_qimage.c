@@ -125,7 +125,7 @@ int main(int argc, char **argv) {
     float *emb = read_floats(ref, "emb.bin", &emb_size);
     int txt_seq = (int)(emb_size / iris_text_dim(ctx));
     iris_transformer_qimage_t *tf = iris_transformer_load_qimage(argv[1]);
-    if (!tf || !iris_transformer_prefill_qimage(tf, emb, txt_seq)) {
+    if (!tf || !iris_transformer_prefill_qimage(tf, emb, txt_seq, NULL, 0)) {
         fprintf(stderr, "transformer load or prefill failed\n");
         return 1;
     }
