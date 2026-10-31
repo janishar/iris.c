@@ -50,8 +50,10 @@ Qwen-Image 2.1 variants (Qwen Research License, non-commercial):
   are prepared like the official image processor: one reference is kept whole
   (downscaled so its 16-px canvas fits 4 MP, reflect-padded, output cropped back),
   several are downscaled under 1 MP and center-cropped. Side cap: IRIS_VAE_MAX_DIM.
-- Qwen-Image currently supports txt2img only (references need the Qwen3-VL
-  vision tower and the VAE encoder).
+- Qwen-Image supports txt2img and one reference image (`-i`). A reference is
+  sized to about 1024x1024 and takes about 1024 of the 1280 text encoder
+  tokens: two do not fit yet, and a prompt with one is limited to about 228
+  tokens. Above the limit the generation fails with an error.
 - Text embeddings are generated via Qwen3.
 - VAE is used for latent/image conversion in both families.
 
@@ -131,6 +133,7 @@ FLUX.3 example:
 Qwen-Image example:
 
     ./iris -d qwen-image-2.1-turbo -p "a fish" -W 1024 -H 1024 -o /tmp/qimage.png
+    ./iris -d qwen-image-2.1-turbo -p "make it a watercolor" -i photo.png -o /tmp/qedit.png
 
 If model weights are missing, use the download script only after user approval.
 
@@ -162,6 +165,11 @@ Qwen-Image reference:
   decodes a latent. C side: `./iris -d MODEL -e emb.bin --noise noise.bin`.
 - `debug/dump_noise.c`: writes the noise iris draws for a seed, for `--noise`.
 - `debug/dump_emb.c`: writes the text embeddings iris computes for a prompt.
+- With `--image` the reference also dumps the reference images, VAE stages,
+  vision tower and text layers. `debug/dump_qimage_refs.c` compares the
+  transformer on them, `debug/dump_qimage_text.c` the text encoder (tokens and
+  positions exactly), `debug/dump_qimage_e2e.c` the whole pipeline from real
+  images with the dumped noise, at any `--ref-resolution`.
 
 Rules:
 - Never add/commit `flux_env/` or `flux2/`.
@@ -517,6 +525,24 @@ theta 10000 (hardcoded upstream), eps 1e-6, causal_condition=true. No biases.
 - Tokenizer may live in `processor/`; Turbo's encoder may be one
   `model.safetensors`.
 
+With references (qwen3_encode_images):
+- The user turn is `<image1><|vision_start|>pad * n<|vision_end|>`, then
+  ` <image2>...`, then the prompt. `<imageN>` is literal text, every piece
+  between special tokens is tokenized alone, n = (H/32) * (W/32).
+- The main vision embeddings replace the pad rows after the embedding lookup,
+  the deepstack features are added to them after layers 0, 1 and 2. Text
+  before the first image is unaffected.
+- MRoPE, all in qwen3_set_rope_positions: text (p, p, p); image
+  (p, p + row, p + col) in merged blocks, then p += max(h, w). With
+  mrope_section [24, 20, 20], frequencies i < 60 follow height when i%3 == 1,
+  width when i%3 == 2, the others the frame.
+- Slot rows are not returned: the transformer fills them with latents, and
+  iris_qimage_ref_t.pos counts the text rows before each block.
+- Reference pipeline (iris_generate_refs_qimage): prepare, VAE encode, vision
+  tower, text, each freed before the next. Without -W -H the target follows the
+  LAST reference at 1024x1024 area (FLUX.3 follows the first), and -W -H never
+  change the reference size.
+
 # Qwen3-VL Vision Tower
 
 `qwen3_vision_encode()`, one image at a time (config in `text_encoder/config.json`):
@@ -542,7 +568,10 @@ theta 10000 (hardcoded upstream), eps 1e-6, causal_condition=true. No biases.
    repeats, y, x]` (first_chunk keeps temporal slot ft-1). It is not a plain
    nearest upsample for the channel-reducing blocks.
 3. **Device path rounding**: bf16 activations give about 1% relative error vs
-   the float32 reference, the same as running upstream in bf16.
+   the float32 reference, the same as running upstream in bf16. Some reference
+   runs amplify it: a 1e-6 change of the noise moves the two-reference test
+   (r2) by 1e-5 against 1.7e-6 with one reference, so that run ends 3.8% off
+   on Metal and 4.4% off in upstream bf16, and 1e-4 off on the CPU in f32.
 4. **Causal device attention**: the prefill is the only causal caller of
    iris_dev_attention in MPS builds. Metal used to return without writing, so
    text keys lost their attention output and velocities were 11-32% off.

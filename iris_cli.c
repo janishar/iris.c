@@ -394,7 +394,7 @@ static int generate_image(const char *prompt, const char *ref_image,
     /* Validate / preload reference before enabling progress callbacks. */
     iris_image *ref = NULL;
     if (ref_image) {
-        if (iris_is_zimage(state.ctx) || iris_is_qimage(state.ctx)) {
+        if (iris_is_zimage(state.ctx)) {
             fprintf(stderr, "Error: img2img is not supported for this model.\n");
             return -1;
         }
@@ -513,7 +513,7 @@ static int generate_image(const char *prompt, const char *ref_image,
 
 static int generate_multiref(const char *prompt, const char **ref_paths, int num_refs,
                              int explicit_width, int explicit_height) {
-    if (iris_is_zimage(state.ctx) || iris_is_qimage(state.ctx)) {
+    if (iris_is_zimage(state.ctx)) {
         fprintf(stderr, "Error: multi-reference img2img is not supported for this model.\n");
         return -1;
     }
@@ -551,7 +551,7 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     }
 
     /* Use explicit size if provided, otherwise the library sizes the output
-     * from the first reference image */
+     * from the references */
     if (explicit_width > 0 && explicit_height > 0) {
         params.width = explicit_width;
         params.height = explicit_height;

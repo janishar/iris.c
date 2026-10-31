@@ -110,11 +110,14 @@ FLUX3_TESTS = [
 ]
 
 
-# Optional Qwen-Image 2.1 test, run only if a Turbo model directory is found
-# (the base model's schedule gives another image). The reference was produced
+# Optional Qwen-Image 2.1 tests, run only if a Turbo model directory is found
+# (the base model's schedule gives another image). The references were produced
 # by debug/qimage_reference.py (official diffusers components, float32)
-# starting from the noise iris generates for seed 42. Correct output measures
-# a mean_diff of 0.6, a broken text prefix about 24.
+# starting from the noise iris generates for seed 42. Correct txt2img output
+# measures a mean_diff of 0.6, a broken text prefix about 24. Correct edit
+# output on Metal measures 0.29; without the vision embeddings or the deepstack
+# features 0.97 to 0.99, without the reference tokens 27, with an unnormalized
+# encoder latent 34: a small input image leaves the vision tower little to add.
 QIMAGE_TESTS = [
     {
         "name": "Qwen-Image 2.1 Turbo test (8 steps, 256x256)",
@@ -125,6 +128,17 @@ QIMAGE_TESTS = [
         "height": 256,
         "reference": "test_vectors/reference_qimage_turbo_8step_256x256_seed42.png",
         "mean_diff_threshold": 5,
+    },
+    {
+        "name": "Qwen-Image 2.1 Turbo edit test (8 steps, 512x512)",
+        "prompt": "Turn the cat into a watercolor painting",
+        "seed": 42,
+        "steps": 8,
+        "width": 512,
+        "height": 512,
+        "input": "test_vectors/img2img_input_256x256.png",
+        "reference": "test_vectors/reference_qimage_turbo_edit_8step_512x512_seed42.png",
+        "mean_diff_threshold": 0.6,
     },
 ]
 

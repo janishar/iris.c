@@ -36,6 +36,18 @@ python debug/qimage_reference.py -d qwen-image-2.1-turbo -W 256 -H 256 \
     -p "A fluffy orange cat sitting on a windowsill" --noise noise.bin -o ref
 ```
 
+## reference_qimage_turbo_edit_8step_512x512_seed42.png
+
+Qwen-Image 2.1 Turbo with the reference image `img2img_input_256x256.png`, from
+the official pipeline in float32, starting from the noise iris generates for
+seed 42:
+```bash
+dump_noise 64 32 32 42 noise.bin
+python debug/qimage_reference.py -d qwen-image-2.1-turbo -W 512 -H 512 \
+    -p "Turn the cat into a watercolor painting" --noise noise.bin \
+    --image test_vectors/img2img_input_256x256.png -o ref
+```
+
 ## Verification
 
 Run `make test` from the project root, or manually:

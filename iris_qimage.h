@@ -124,6 +124,19 @@ iris_image *iris_vae_decode_qimage(iris_vae_qimage_t *vae, const float *latent,
                                    int h, int w);
 
 /* ========================================================================
+ * Generation (iris.c)
+ * ======================================================================== */
+
+/* Generate with n reference images prepared at ref_area. noise (noise_size
+ * floats), if not NULL, replaces the seed's; out_latent, if not NULL, receives
+ * the final latent (caller frees). Parity runs use these three arguments;
+ * iris_img2img() and iris_multiref() pass IRIS_QIMAGE_REF_AREA and nothing. */
+iris_image *iris_generate_refs_qimage(iris_ctx *ctx, const char *prompt,
+                                      const iris_image **refs, int n, int ref_area,
+                                      const float *noise, int noise_size,
+                                      const iris_params *params, float **out_latent);
+
+/* ========================================================================
  * Sampler (iris_sample.c)
  * ======================================================================== */
 

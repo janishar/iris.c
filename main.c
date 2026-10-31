@@ -585,7 +585,8 @@ int main(int argc, char *argv[]) {
                         i + 1, inputs[i]->width, inputs[i]->height, inputs[i]->channels);
         }
 
-        /* Without an explicit size the library uses the first reference's */
+        /* Without an explicit size the library sizes the output from the
+         * references (the first one's, the last one's for Qwen-Image) */
         if (!width_set || !height_set) params.width = params.height = 0;
 
         /* Generate with multi-reference */

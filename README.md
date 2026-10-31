@@ -19,7 +19,7 @@ Supported model families:
   - Text-to-image, editing (`-i image`) and multi-reference generation (`-i` repeated).
 - **[Qwen-Image 2.1](https://huggingface.co/Qwen/Qwen-Image-2.1)** (by Qwen):
   - **Turbo** (fixed 8-step schedule, no CFG) and **base** (40 steps, no CFG). Qwen Research License (non-commercial).
-  - Text-to-image only for now. Checked against the official diffusers classes on small random-weight models; not yet run on the real weights.
+  - Text-to-image and editing (`-i image`). One reference, sized to about 1024x1024: two do not fit in the text encoder's 1280 tokens yet, and a prompt with one is limited to about 228 tokens. The output size defaults to the reference's aspect at about 1024x1024.
 
 All the models run fully on the GPU with the Metal (Apple), CUDA (NVIDIA) and ROCm (AMD) backends.
 
@@ -100,7 +100,7 @@ That's it. No Python runtime required at inference time.
 - **GPU acceleration**: Metal on Apple Silicon Macs (automatic), CUDA on NVIDIA and ROCm on AMD GPUs. On Apple Silicon it is faster than PyTorch's optimized MPS pipeline
 - **Runs where Python can't**: Memory-mapped weights (default) enable inference on 8GB RAM systems where the Python ML stack cannot run at all
 - **Text-to-image**: Generate images from text prompts
-- **Image-to-image**: Transform existing images guided by prompts (Flux models)
+- **Image-to-image**: Transform existing images guided by prompts (Flux and Qwen-Image models)
 - **Multi-reference**: Combine multiple reference images (e.g., `-i car.png -i beach.png` for "car on beach")
 - **Integrated text encoder**: Qwen3 encoder built-in (4B or 8B depending on model, Qwen3-VL 4B for FLUX.3), no external embedding computation needed
 - **Memory efficient**: Automatic encoder release after encoding (up to ~16GB freed)
@@ -140,6 +140,7 @@ Transform an existing image based on a prompt:
 
 ```bash
 ./iris -d flux-klein-4b -p "oil painting style" -i photo.png -o painting.png
+./iris -d qwen-image-2.1-turbo -p "oil painting style" -i photo.png -o painting.png
 ```
 
 FLUX.2 uses **in-context conditioning** for image-to-image generation. Unlike traditional approaches that add noise to the input image, FLUX.2 passes the reference image as additional tokens that the model can attend to during generation. This means:
@@ -352,6 +353,7 @@ The tests compare generated images against reference images in `test_vectors/`. 
 | Z-Image | 256x256 | 2 | Z-Image smoke test (auto-detected) |
 | FLUX.3 | 256x256 | 4 | FLUX.3 Klein against the official pipeline (auto-detected) |
 | Qwen-Image | 256x256 | 8 | Qwen-Image 2.1 Turbo against the official components (auto-detected) |
+| Qwen-Image edit | 512x512 | 8 | The same with a reference image against the official pipeline (auto-detected) |
 
 You can also run the test script directly for more options:
 ```bash
@@ -553,6 +555,8 @@ Qwen-Image 2.1 runs single-stream blocks over `[TEXT | IMAGE]` with block-causal
 | RoPE | 3 axes (frame, h, w) = 16 + 56 + 56 dims, theta 10000; image grid centred on 0 |
 | Text Encoder | Qwen3-VL-8B text model, last layer before the final norm (4096 dims), system prompt tokens dropped |
 | VAE | Wan-derived, single frame (2D), 64 latent channels, 16x compression, RGBA output |
+
+With `-i`, a reference is resized to about 1024x1024 (`-W -H` only set the output, whose default follows the last reference) and enters twice. The Qwen3-VL vision tower feeds the text encoder: its embeddings fill the image's slots in the prompt and its deepstack features join the first three layers. The VAE encoder feeds the transformer: the reference latents replace those slots, so the prefix is `[text | reference | text]`, computed once like the prompt, and only the target runs at each step.
 
 ## Timestep Schedules
 
