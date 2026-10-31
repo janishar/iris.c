@@ -1113,6 +1113,10 @@ static void print_banner(void) {
 }
 
 int iris_cli_run(iris_ctx *ctx, const char *model_dir) {
+    /* Line-buffered even on a pipe, so a program driving the REPL sees each
+     * line when it is printed rather than when the next image flushes it. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     /* Initialize state */
     memset(&state, 0, sizeof(state));
     state.ctx = ctx;
