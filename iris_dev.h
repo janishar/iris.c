@@ -87,8 +87,8 @@ void iris_dev_head_norm_rope(uint16_t *x, int ld, const float *w,
 /* Scaled dot-product attention over bf16 [seq, heads * head_dim] tensors.
  * q, k, v share the row stride ldi, out has row stride ldo. With fewer kv
  * heads (GQA), query head h uses kv head h / (heads / kv_heads).
- * causal: query i ignores keys j > i. key_mask: device int [seq_k],
- * 0 = ignored key, or NULL. */
+ * causal: 0 = all keys, n > 0 = query i sees keys j < i + n. key_mask:
+ * device int [seq_k], 0 = ignored key, or NULL. */
 void iris_dev_attention(uint16_t *out, int ldo,
                         const uint16_t *q, const uint16_t *k, const uint16_t *v,
                         int ldi, int seq_q, int seq_k, int heads, int kv_heads,

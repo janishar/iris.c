@@ -796,11 +796,11 @@ static IrisDevGraph *sdpa_graph(int seq_q, int seq_k, int heads, int head_dim, f
         [shapes addObject:ms];
     }
     if (causal) {
-        /* Additive bias: -inf (bf16) where query i meets key j > i. */
+        /* Additive bias: -inf (bf16) where query i meets key j >= i + causal. */
         NSMutableData *tri = [NSMutableData dataWithLength:(size_t)seq_q * seq_k * sizeof(uint16_t)];
         uint16_t *b = tri.mutableBytes;
         for (int i = 0; i < seq_q; i++)
-            for (int j = i + 1; j < seq_k; j++) b[(size_t)i * seq_k + j] = 0xFF80;
+            for (int j = i + causal; j < seq_k; j++) b[(size_t)i * seq_k + j] = 0xFF80;
         MPSGraphTensor *t = [g.graph constantWithData:tri shape:@[@1, @1, @(seq_q), @(seq_k)]
                                              dataType:MPSDataTypeBFloat16];
         mask = mask ? [g.graph additionWithPrimaryTensor:mask secondaryTensor:t name:nil] : t;

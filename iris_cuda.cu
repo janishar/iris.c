@@ -525,7 +525,7 @@ __global__ void k_softmax(uint16_t *P, const float *S, int nq, int seq_k, int q0
     int qi = q0 + (int)(row % nq);
     const float *s = S + row * seq_k;
     uint16_t *p = P + row * seq_k;
-    int limit = causal ? (qi + 1 < seq_k ? qi + 1 : seq_k) : seq_k;
+    int limit = causal ? (qi + causal < seq_k ? qi + causal : seq_k) : seq_k;
 
     float m = -INFINITY;
     for (int j = threadIdx.x; j < limit; j += blockDim.x)
