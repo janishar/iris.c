@@ -1,8 +1,9 @@
 # Task: add Qwen-Image 2.1 and Turbo support
 
-Status: implemented and verified on the real weights on MPS and BLAS (see
-"Measured on the real weights"). Not built: CUDA and ROCm (no toolchain on
-the Mac). Delete this file when the work is merged.
+Status: text-to-image implemented and verified on the real weights on MPS,
+CUDA and BLAS (see "Measured on the real weights"). ROCm has never been
+compiled. Phase 2 (reference images) is planned below, not started. Delete
+this file when the work is merged.
 
 ## Implementation status
 
@@ -55,15 +56,34 @@ the reference vectors. REPL: the first generation of a prompt is byte-identical
 to the CLI. A repeated prompt uses the 4-bit embedding cache, as on the other
 distilled models, and differs by a mean of 1.66/255.
 
-Not verified: CUDA and ROCm builds, generic at runtime (it builds), 2K sizes.
+The GPU VAE decoder (`iris_dev_pixel_rms_norm`, `iris_dev_dup_up_add`) decodes
+the reference latents within a mean of 0.15/255 (max 12) on Metal and CUDA, which
+is bf16 rounding; the CPU decoder stays within 1/255.
+
+CUDA, RTX PRO 6000 Blackwell, CUDA 13, no OpenBLAS: velocity relative L2 3.2e-3
+to 1.4e-2 on all three runs, free-run latent 1.7e-2 to 2.2e-2, reference test
+mean 1.07. Turbo 1024x1024 takes 4.5 s (1.6 s denoising, 0.4 s decode), base
+11.1 s, and 2048x2048, 2752x1536 and 1536x2752 take 13 s. With the VAE on the GPU,
+Turbo on MPS takes 26.7 s at 1024x1024 (was 52 s), base 117 s (was 139 s).
+
+MPS at 2048x2048 and 2752x1536: 150 s (128 s denoising), peak footprint 44 GB, no
+transformer eviction needed.
+
+M5 Pro Neural Accelerators: nothing in iris targets them, and MPSGraph is not
+documented to use them. Measured on real iris runs, differencing base and Turbo:
+107 J per 1024x1024 step, 3.2 pJ/MAC, matching MLX with its Neural Accelerator
+kernels (3.3) and not without them (9.1) or f32 (13.1). bf16 is what keeps this
+path: f32 GEMMs and attention run at a quarter of the rate. Benchmarks were on
+macOS 27.2, and MPSGraph routing can change with the OS.
+
+Not verified: ROCm (never compiled; downloading its toolchain was blocked), generic
+at runtime (it builds).
 `make test` needs numpy in `python3`, and its three Flux.2 tests need
 `flux-klein-4b`, which is not on this machine.
 
 ## Remaining work
 
-Optional: a device path for the VAE decoder (new kernels: per-pixel RMS norm,
-DupUp). It would cut the 22.8 s decode at 1024x1024, and it is needed for speed
-on CUDA builds without OpenBLAS.
+Compile `iris_cuda.cu` with hipcc, then Phase 2.
 
 ## Goal
 
@@ -570,32 +590,79 @@ clamp to [-1, 1]
 
 ## Phase 2: reference images and editing (separate task)
 
-Much bigger than Phase 1:
+Audited against diffusers 0.42 dev and transformers 5.17 in the venv. Everything
+below comes from reading the source; only AvgDown, the RoPE and tokenization were
+executed.
 
-- VAE encoder: residual down blocks with `QwenImage21AvgDown3D`, `quant_conv`,
-  and the argmax latent normalized as `(z - mean) / std`.
-- Qwen3-VL vision tower: 27 layers, dim 1152, patch 16, merge 2, deepstack at
-  8/16/24.
-- Qwen3 changes: `<|image_pad|>` substitution and 3-axis MRoPE (sections
-  `[24,20,20]`, interleaved) on the CPU, Metal and device paths. Deepstack
-  injection into early text layers is assumed from Qwen3-VL's design. Confirm
-  it in the transformers source.
-- Template: `<image1><|vision_start|><|image_pad|><|vision_end|>` per image
-  (`<image{i}>` with a leading space from the second image), before the prompt.
-- Transformer: each vision slot expands to 2x2 latent tokens and is
-  overwritten by that image's latents. Every image block is bidirectional
-  internally and causal toward everything after it. The RoPE frame axis
-  freezes at the preceding text position, then advances by `max(h, w)` after
-  each image block. A text segment after an image needs causal attention with
-  a query offset, which `iris_dev_attention` lacks.
-- Prefix KV memory: about 2.3 GB per 1 MP reference, about 22 GB for 10.
-- Reference preparation: RGBA, resized to about 1 MP on the 32-pixel grid
-  (`calculate_dimensions`). The copy for the vision encoder only is composited
-  over white.
+### Facts
 
-Vision tokens are overwritten by latents in the transformer, so the tower only
-affects the text that follows the image. It still cannot be skipped, because
-the checkpoint was trained with it.
+- **Vision tower** (27 blocks, 1152, 16 heads, head_dim 72, patch 16, merge 2):
+  windowless, one image at a time. Patch embed is a Conv3d on two identical frames,
+  so a linear `[1152, 768]` with summed weights. Position embedding 48x48,
+  bilinear with align_corners. Patches are block-major. RoPE theta 10000, split-half
+  pairs (i, i + 36), Q and K only, no head norm. Blocks are pre-norm, LayerNorm
+  with affine, GELU-tanh MLP. Mergers use exact GELU; deepstack mergers read blocks
+  8, 16, 24 and norm after flattening 2x2.
+- **Deepstack**: outputs are added at the image rows right after text layers 0, 1, 2.
+- **Vision input**: RGB, `2v/255 - 1`, `<|image_pad|>` count `(H/32)*(W/32)`, 1024
+  at 1024x1024.
+- **Text**: `<image1>` is literal text; pieces between special tokens tokenize
+  separately; the prompt is tokenized on its own. Drop index stays 14. MRoPE is one
+  function, `qwen3_set_rope_positions`: text `(p, p, p)`, image `(p, p + r, p + c)`
+  in merged units, then `p += max(gh, gw) / 2`. Frequencies with `i < 60`: `i%3==1`
+  height, `i%3==2` width, others frame.
+- **Transformer**: `[8 text][B1][text]...[BN][vision_end, prompt, tail][target]`.
+  Each slot is 4 rows, filled with latents in plain raster order. Position advance
+  after a block is `max(h, w)` in latent units (unlike the text encoder). Target
+  frame = text rows + sum of `max(hi, wi)`. Text and references use t = 0. `mu` and
+  noise depend on the target only. Prefill runs 2N+1 segments: Q `[start, end)`, K/V
+  `[0, end)`; text segments are causal.
+- **Attention offset**: treat `causal` as an integer, 0 = none, n > 0 = query i sees
+  keys `j < i + n`. Existing callers pass 1, the tail run passes `start + 1`. One-line
+  changes in iris_cuda.cu (`qi + causal`), iris_dev_metal.m (`j = i + causal`) and
+  the CPU attention.
+- **VAE encoder**: dims `[96,96,192,384,768,768]`, down conv pads right and bottom
+  by 1, then 3x3 stride 2 (`iris_dev_conv2d(k=3, stride=2, pad_before=0, pad_after=1)`).
+  `out[o, y, x] = (1/G) sum_g X[oG+g, y, x]`, `G = cin*ft*fs^2/cout`,
+  `X[((c*ft+t)*2+i)*2+j] = in[c, 2y+i, 2x+j]` if `t == ft-1`, else 0. Then `norm_out`,
+  SiLU, `conv_out`, `quant_conv`, first 64 channels, `(z - mean) / std`.
+- **Reference prep**: RGBA, `round(sqrt(1024^2 * ratio) / 32) * 32` (banker's),
+  Lanczos with premultiplied alpha, skipped at equal size. The size ignores `-W -H`.
+  The default target size follows the **last** image. The vision copy is the resized
+  RGBA over white.
+
+### Gaps the plan must cover
+
+- **1280 token limit**: a 1024x1024 reference takes 1024 encoder tokens, leaving
+  228 for the prompt, and two references do not fit. Limits are the Metal
+  threadgroup arrays, `attn_scores` (`heads*seq^2`, int overflow above about 8191)
+  and the static work buffers. This is M8.
+- `QWEN3_DEV` is off on Metal, and Metal attention refuses GQA.
+- `iris_dev_head_norm_rope` cannot serve the vision tower: it normalizes and needs
+  a power-of-two thread count.
+- `iris_image_convert` mishandles 2-channel input, `iris_image_resize` has no
+  premultiply step.
+- The REPL's embedding cache (`emb_cache_lookup_ex` in iris_cli.c) is keyed on the
+  prompt, so it must not serve image-conditioned prompts.
+
+### Milestones
+
+Each reads Python dumps, so stages are tested alone. Ship one reference first.
+
+| # | Milestone | Done when |
+|---|---|---|
+| M0 | `qimage_reference.py --image`, per-stage dumps | dumps exist for 1 and 2 references |
+| M1 | Reference prep | exact at equal size, RMS <= 2/255 when resized |
+| M2 | VAE encoder, CPU then GPU (`iris_dev_avg_down_add`) | per-stage match, then bf16 tolerance |
+| M3 | Transformer interleaving, integer `causal` | block states and v match, 1 and 2 refs from dumps |
+| M4 | Vision tower, CPU (`iris_qwen3_vision.c`) | blocks, deepstack, embeds match |
+| M5 | Vision tower, GPU (`iris_dev_rope`, `iris_dev_gelu_tanh`) | bf16 tolerance |
+| M6 | Text encoder with images, up to 1280 tokens | tokens, positions, layers, `emb.bin` non-slot rows |
+| M7 | End to end, one reference | final latent and image match, Turbo and base |
+| M8 | Long sequences, 2+ references | 2-ref `emb.bin` match, 10-ref memory run |
+
+GPU memory at 1 MP: about 17 GB peak for one reference, 42 GB for ten (prefix K/V
+2.2 and 21.5 GB). Skipped: CFG with references, VAE tiling.
 
 ## Licence
 

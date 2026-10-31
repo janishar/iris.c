@@ -21,7 +21,7 @@ Supported model families:
   - **Turbo** (fixed 8-step schedule, no CFG) and **base** (40 steps, no CFG). Qwen Research License (non-commercial).
   - Text-to-image only for now. Checked against the official diffusers classes on small random-weight models; not yet run on the real weights.
 
-All the models run fully on the GPU with the Metal (Apple), CUDA (NVIDIA) and ROCm (AMD) backends, except the Qwen-Image VAE decoder, which runs on the CPU (BLAS) for now.
+All the models run fully on the GPU with the Metal (Apple), CUDA (NVIDIA) and ROCm (AMD) backends.
 
 ## Quick Start
 

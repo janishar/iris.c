@@ -522,6 +522,10 @@ theta 10000 (hardcoded upstream), eps 1e-6, causal_condition=true. No biases.
 4. **Causal device attention**: the prefill is the only causal caller of
    iris_dev_attention in MPS builds. Metal used to return without writing, so
    text keys lost their attention output and velocities were 11-32% off.
+5. **VAE memory**: a 2048x2048 decode needs about 22 GB of GPU activations. When
+   they do not fit next to the transformer, it is unloaded first (the next
+   generation reloads it). The CPU decoder is the last resort: without BLAS it
+   takes minutes at 256x256.
 
 # Device Backend (CUDA / ROCm / Metal)
 
@@ -545,8 +549,8 @@ theta 10000 (hardcoded upstream), eps 1e-6, causal_condition=true. No biases.
   Work goes into one command buffer, committed by sync/download/upload/free.
   GEMMs and attention use MPSGraph (bf16 matmul, fused SDPA on contiguous
   copies of q/k/v, key mask and causal triangle as an additive bias). In MPS
-  builds only the transformers use it: the Qwen3
-  and VAE device paths are compiled out (QWEN3_DEV / VAE_DEV).
+  builds the transformers and the Qwen-Image VAE use it: the Qwen3 and Flux
+  VAE device paths are compiled out (QWEN3_DEV / VAE_DEV).
 
 Known pitfalls:
 1. rocBLAS has only fallback (slow) bf16 -> f32 GEMM kernels on gfx1151:
@@ -556,6 +560,10 @@ Known pitfalls:
    staging path. GEMMs can read host memory fine, but uploads must not rely on it.
 3. RDNA3 WMMA: A/B operands hold a row/column per lane (replicated in both
    half-waves); the accumulator holds column lane%16, rows 2e + lane/16.
+4. A Metal command buffer holds 32 residency sets and an MPSGraph takes about
+   two. The VAE encodes dozens of shapes, which aborted at small sizes (large
+   ones hid it, MPSGraph commits by itself under load): run_graph flushes after
+   CMD_MAX_GRAPHS distinct graphs.
 
 # Test Commands
 
