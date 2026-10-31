@@ -47,7 +47,7 @@ static size_t g_gn_scratch_size = 0;
 static id<MTLComputePipelineState> p_f32_to_bf16, p_silu, p_add, p_add_bias, p_swiglu,
     p_residual, p_fill_rows, p_layer_norm_mod, p_rms_norm, p_rms_norm_residual, p_key_mask_bias,
     p_head_norm_rope, p_copy_2d, p_im2col,
-    p_gn_partial, p_gn_finalize, p_gn_apply, p_upsample2x, p_pixel_rms_norm, p_dup_up_add;
+    p_gn_partial, p_gn_finalize, p_gn_apply, p_upsample2x, p_pixel_rms_norm, p_dup_up_add, p_avg_down_add;
 
 /* ========================================================================
  * Kernels
@@ -300,6 +300,23 @@ kernel void dup_up_add(device float *out, device const float *in, constant int &
     int src = (((o * ft + ft - 1) * 2 + (y2 & 1)) * 2 + (x2 & 1)) / repeats;
     out[i] += in[((ulong)(y2 / 2) * w + x2 / 2) * cin + src];
 }
+
+kernel void avg_down_add(device float *out, device const float *in, constant int &w,
+                         constant int &cin, constant int &cout, constant int &ft,
+                         constant int &group, constant ulong &n,
+                         uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    int o = int(i % cout);
+    ulong p = i / cout;
+    int x = int(p % (w / 2)), y = int(p / (w / 2));
+    float s = 0;
+    for (int g = 0; g < group; g++) {
+        int idx = o * group + g, rest = idx >> 2;
+        if (rest % ft == ft - 1)
+            s += in[((ulong)(2 * y + ((idx >> 1) & 1)) * w + 2 * x + (idx & 1)) * cin + rest / ft];
+    }
+    out[i] += s / group;
+}
 )MSL";
 
 /* ========================================================================
@@ -347,11 +364,12 @@ int iris_dev_init(void) {
         p_upsample2x = pipeline(lib, @"upsample2x");
         p_pixel_rms_norm = pipeline(lib, @"pixel_rms_norm");
         p_dup_up_add = pipeline(lib, @"dup_up_add");
+        p_avg_down_add = pipeline(lib, @"avg_down_add");
         if (!p_f32_to_bf16 || !p_silu || !p_add || !p_add_bias || !p_swiglu || !p_residual ||
             !p_fill_rows || !p_layer_norm_mod || !p_rms_norm || !p_rms_norm_residual ||
             !p_key_mask_bias || !p_head_norm_rope || !p_copy_2d || !p_im2col ||
             !p_gn_partial || !p_gn_finalize || !p_gn_apply || !p_upsample2x ||
-            !p_pixel_rms_norm || !p_dup_up_add)
+            !p_pixel_rms_norm || !p_dup_up_add || !p_avg_down_add)
             return 0;
         g_buffers = [NSMutableArray array];
         g_graphs = [NSMutableDictionary dictionary];
@@ -1004,6 +1022,24 @@ void iris_dev_dup_up_add(float *out, const float *in, int h, int width, int cin,
         arg_int(e, cout, 4);
         arg_int(e, ft, 5);
         arg_int(e, cout * ft * 4 / cin, 6);
+        arg_ulong(e, n, 7);
+        end_elementwise(e, n);
+    }
+}
+
+void iris_dev_avg_down_add(float *out, const float *in, int h, int width, int cin, int cout,
+                           int ft) {
+    size_t n = (size_t)(h / 2) * (width / 2) * cout;
+    if (!n) return;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> e = begin(p_avg_down_add);
+        arg_ptr(e, out, 0);
+        arg_ptr(e, in, 1);
+        arg_int(e, width, 2);
+        arg_int(e, cin, 3);
+        arg_int(e, cout, 4);
+        arg_int(e, ft, 5);
+        arg_int(e, cin * ft * 4 / cout, 6);
         arg_ulong(e, n, 7);
         end_elementwise(e, n);
     }

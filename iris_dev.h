@@ -141,6 +141,13 @@ void iris_dev_pixel_rms_norm(float *out, const float *in, const float *gamma,
 void iris_dev_dup_up_add(float *out, const float *in, int h, int width, int cin, int cout,
                          int ft);
 
+/* Space-to-channel shortcut of in [h * w, cin], added to out [h/2 * w/2, cout]:
+ *   out[(y, x), o] += sum_{g < G} X[o * G + g] / G, with G = cin * ft * 4 / cout
+ * and X[((c * ft + t) * 2 + i) * 2 + j] = in[(2y + i, 2x + j), c] for
+ * t = ft - 1, 0 for other t. */
+void iris_dev_avg_down_add(float *out, const float *in, int h, int width, int cin, int cout,
+                           int ft);
+
 #ifdef __cplusplus
 }
 #endif

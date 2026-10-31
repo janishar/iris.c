@@ -1,10 +1,10 @@
 /*
- * Qwen-Image 2.1 VAE Decoder
+ * Qwen-Image 2.1 VAE
  *
- * Decoder of AutoencoderKLQwenImage21, a Wan-derived VAE specialized to a
- * single frame: its "causal 3D" convolutions are plain 2D convolutions
- * (symmetric padding), and with one frame the temporal convolutions never
- * run, so the whole decoder is 2D:
+ * AutoencoderKLQwenImage21, a Wan-derived VAE specialized to a single frame:
+ * its "causal 3D" convolutions are plain 2D convolutions (symmetric padding),
+ * and with one frame the temporal convolutions never run, so everything is
+ * 2D. Decoder:
  *
  *   x = post_quant_conv(latent * std + mean)        1x1, z_dim -> z_dim
  *   x = conv_in(x)                                  3x3, z_dim -> top width
@@ -13,6 +13,15 @@
  *       DupUp shortcut of the block input
  *   x = conv_out(silu(norm_out(x)))                 -> RGBA
  *   clamp to [-1, 1]
+ *
+ * Encoder, the mirror image, loaded at the first encode:
+ *
+ *   x = conv_in(rgba)                               3x3, 4 -> base width
+ *   x = down blocks (residual): res blocks, 3x3 conv with stride 2 (zero
+ *       padding right and bottom), plus an AvgDown shortcut of the block input
+ *   x = mid: res, attention, res
+ *   x = quant_conv(conv_out(silu(norm_out(x))))     -> mean | logvar
+ *   latent = (mean - latents_mean) / latents_std
  *
  * Norms are per-pixel RMS norms over the channels: x / ||x|| * sqrt(C) *
  * gamma (F.normalize, no epsilon inside the root). Res block: shortcut
@@ -49,6 +58,12 @@
 #define QV_MAX_RES     4     /* res blocks per up block */
 #define QV_ATTN_QCHUNK 256   /* queries per attention chunk */
 
+/* Stage hooks for debug/cmp_qimage_vae_enc.c, which includes this file. */
+#ifndef QV_STAGE
+#define QV_STAGE(name, index, x, c, h, w)
+#define QD_STAGE(name, index, x, c, h, w)
+#endif
+
 /* ========================================================================
  * Data Structures
  * ======================================================================== */
@@ -69,27 +84,43 @@ typedef struct {
     int cin, cout;
     int num_res;
     qv_res_t res[QV_MAX_RES];
-    int upsample;            /* 2x upsampling with a DupUp shortcut */
-    int factor_t;            /* temporal factor of the DupUp shortcut (1 or 2) */
-    qv_conv_t up_conv;       /* conv after the nearest 2x upsampling */
-} qv_up_t;
+    int resample;            /* 2x up or downsampling with a shortcut */
+    int factor_t;            /* temporal factor of the shortcut (1 or 2) */
+    qv_conv_t conv;          /* 3x3 conv of the resampling */
+} qv_block_t;
+
+typedef struct {
+    float *gamma;            /* norm [C] */
+    qv_conv_t qkv;           /* 1x1, C -> 3C */
+    qv_conv_t proj;          /* 1x1, C -> C */
+} qv_attn_t;
+
+/* One direction of the VAE. */
+typedef struct {
+    qv_conv_t quant;         /* post_quant_conv or quant_conv */
+    qv_conv_t conv_in, conv_out;
+    qv_res_t mid_res[2];
+    qv_attn_t attn;
+    int num_blocks;
+    qv_block_t block[QV_MAX_LEVELS];
+    float *norm_out;         /* [C] */
+#ifdef IRIS_DEV
+    struct qv_dev *dev;      /* device copy, uploaded at the first use */
+#endif
+} qv_net_t;
 
 struct iris_vae_qimage {
     int z_dim;
     int out_channels;        /* 4 (RGBA) */
     float mean[QV_MAX_CH], std[QV_MAX_CH];
+    qv_net_t dec;
+    qv_net_t *enc;           /* NULL until the first encode */
 
-    qv_conv_t post_quant, conv_in, conv_out;
-    qv_res_t mid_res[2];
-    float *attn_gamma;       /* mid attention norm [C] */
-    qv_conv_t attn_qkv;      /* 1x1, C -> 3C */
-    qv_conv_t attn_proj;     /* 1x1, C -> C */
-    int num_up;
-    qv_up_t up[QV_MAX_LEVELS];
-    float *norm_out;         /* [C] */
-#ifdef IRIS_DEV
-    struct qv_dev *dev;      /* device copy, uploaded at the first decode */
-#endif
+    /* What the encoder load needs */
+    char *dir;               /* model directory */
+    int in_channels, enc_res, levels;
+    int enc_dims[QV_MAX_LEVELS + 1];
+    int enc_ft[QV_MAX_LEVELS];
 };
 
 /* ========================================================================
@@ -155,13 +186,13 @@ static float *res_forward(const qv_res_t *r, float *x, int h, int w, int consume
 /* Single-head self-attention over the pixels of x [c, h, w], in place:
  * x += proj(softmax(q^T k / sqrt(c)) v), with q, k, v from a 1x1 conv of
  * the normalized x. */
-static void mid_attention(const iris_vae_qimage_t *vae, float *x, int c, int h, int w) {
+static void mid_attention(const qv_attn_t *a, float *x, int c, int h, int w) {
     int n = h * w;
     size_t cn = (size_t)c * n;
     float *t = malloc(cn * sizeof(float));
     memcpy(t, x, cn * sizeof(float));
-    pixel_rms_norm(t, vae->attn_gamma, c, n, 0);
-    float *qkv = conv(&vae->attn_qkv, t, h, w);   /* [3c, n]: q, k, v */
+    pixel_rms_norm(t, a->gamma, c, n, 0);
+    float *qkv = conv(&a->qkv, t, h, w);   /* [3c, n]: q, k, v */
     const float *q = qkv, *k = qkv + cn, *v = qkv + 2 * cn;
     float *scores = malloc((size_t)QV_ATTN_QCHUNK * n * sizeof(float));
     float scale = 1.0f / sqrtf((float)c);
@@ -202,7 +233,7 @@ static void mid_attention(const iris_vae_qimage_t *vae, float *x, int c, int h, 
     }
     free(scores);
     free(qkv);
-    float *o = conv(&vae->attn_proj, t, h, w);
+    float *o = conv(&a->proj, t, h, w);
     for (size_t i = 0; i < cn; i++) x[i] += o[i];
     free(o);
     free(t);
@@ -231,22 +262,103 @@ static void dup_up_add(float *out, const float *in, int cin, int cout, int ft, i
 
 /* Up block on x [cin, h, w] (consumed). Returns [cout, h', w'] and updates
  * h, w when the block upsamples. */
-static float *up_forward(const qv_up_t *u, float *x, int *h, int *w) {
+static float *up_forward(const qv_block_t *u, float *x, int *h, int *w) {
     float *cur = x;
     for (int r = 0; r < u->num_res; r++)
-        cur = res_forward(&u->res[r], cur, *h, *w, r > 0 || !u->upsample);
-    if (!u->upsample) return cur;
+        cur = res_forward(&u->res[r], cur, *h, *w, r > 0 || !u->resample);
+    if (!u->resample) return cur;
 
     float *big = malloc((size_t)u->cout * 4 * *h * *w * sizeof(float));
     iris_upsample_nearest(big, cur, 1, u->cout, *h, *w, 2, 2);
     free(cur);
-    float *out = conv(&u->up_conv, big, 2 * *h, 2 * *w);
+    float *out = conv(&u->conv, big, 2 * *h, 2 * *w);
     free(big);
     dup_up_add(out, x, u->cin, u->cout, u->factor_t, *h, *w);
     free(x);
     *h *= 2;
     *w *= 2;
     return out;
+}
+
+/* out [cout, h, w] += AvgDown(in [cin, 2h, 2w]) (QwenImage21AvgDown3D): a zero
+ * frame before the real one, space-to-channel, mean over g channels:
+ *   out[((c*ft + ft-1)*2 + i)*2 + j) / g, y, x] += in[c, 2y+i, 2x+j] / g
+ * with g = cin * ft * 4 / cout. */
+static void avg_down_add(float *out, const float *in, int cin, int cout, int ft, int h, int w) {
+    int g = cin * ft * 4 / cout;
+    float scale = 1.0f / g;
+    for (int c = 0; c < cin; c++) {
+        for (int i = 0; i < 2; i++) {
+            for (int j = 0; j < 2; j++) {
+                int o = (((c * ft + ft - 1) * 2 + i) * 2 + j) / g;
+                const float *s = in + (size_t)c * 4 * h * w;
+                float *d = out + (size_t)o * h * w;
+                for (int y = 0; y < h; y++)
+                    for (int x = 0; x < w; x++)
+                        d[(size_t)y * w + x] += scale * s[(size_t)(2 * y + i) * 2 * w + 2 * x + j];
+            }
+        }
+    }
+}
+
+/* 3x3 convolution with stride 2 of x [cin, h, w], zero-padded by 1 on the
+ * right and bottom (caller frees). */
+static float *down_conv(const qv_conv_t *c, const float *x, int h, int w) {
+    float *pad = calloc((size_t)c->cin * (h + 1) * (w + 1), sizeof(float));
+    float *out = malloc((size_t)c->cout * (h / 2) * (w / 2) * sizeof(float));
+    for (int ch = 0; ch < c->cin; ch++)
+        for (int y = 0; y < h; y++)
+            memcpy(pad + ((size_t)ch * (h + 1) + y) * (w + 1), x + ((size_t)ch * h + y) * w,
+                   (size_t)w * sizeof(float));
+    iris_conv2d(out, pad, c->w, c->b, 1, c->cin, c->cout, h + 1, w + 1, c->k, c->k, 2, 0);
+    free(pad);
+    return out;
+}
+
+/* Down block on x [cin, h, w] (consumed). Returns [cout, h', w'] and updates
+ * h, w when the block downsamples. */
+static float *down_forward(const qv_block_t *b, float *x, int *h, int *w) {
+    size_t n = (size_t)b->cin * *h * *w;
+    float *cur = x;
+    for (int r = 0; r < b->num_res; r++)
+        cur = res_forward(&b->res[r], cur, *h, *w, r > 0);
+    if (b->resample) {
+        float *out = down_conv(&b->conv, cur, *h, *w);
+        free(cur);
+        cur = out;
+        *h /= 2;
+        *w /= 2;
+        avg_down_add(cur, x, b->cin, b->cout, b->factor_t, *h, *w);
+    } else {
+        for (size_t i = 0; i < n; i++) cur[i] += x[i];
+    }
+    free(x);
+    return cur;
+}
+
+/* The encoder on rgba [in_channels, h, w]: mean | logvar [2z, h', w'] (caller
+ * frees). */
+static float *encode_host(const qv_net_t *e, const float *rgba, int h, int w) {
+    float *x = conv(&e->conv_in, rgba, h, w);
+    QV_STAGE("conv_in", -1, x, e->conv_in.cout, h, w);
+    for (int i = 0; i < e->num_blocks; i++) {
+        x = down_forward(&e->block[i], x, &h, &w);
+        QV_STAGE("down", i, x, e->block[i].cout, h, w);
+    }
+    int c = e->mid_res[0].cout;
+    x = res_forward(&e->mid_res[0], x, h, w, 1);
+    mid_attention(&e->attn, x, c, h, w);
+    x = res_forward(&e->mid_res[1], x, h, w, 1);
+    QV_STAGE("mid", -1, x, c, h, w);
+    pixel_rms_norm(x, e->norm_out, c, h * w, 1);
+    QV_STAGE("norm_out", -1, x, c, h, w);
+    float *y = conv(&e->conv_out, x, h, w);
+    free(x);
+    QV_STAGE("conv_out", -1, y, e->conv_out.cout, h, w);
+    x = conv(&e->quant, y, h, w);
+    free(y);
+    QV_STAGE("quant", -1, x, e->quant.cout, h, w);
+    return x;
 }
 
 /* [channels, h, w] floats in [-1, 1] to an image: clamp, then round(v * 255)
@@ -287,17 +399,23 @@ typedef struct {
     qd_conv_t conv1, conv2, shortcut;
 } qd_res_t;
 
-struct qv_dev {
-    qd_conv_t post_quant, conv_in, conv_out, attn_qkv, attn_proj;
-    qd_res_t mid_res[2];
-    qd_res_t res[QV_MAX_LEVELS][QV_MAX_RES];
-    qd_conv_t up_conv[QV_MAX_LEVELS];
-    float *attn_gamma, *norm_out;
+typedef struct {
+    float *gamma;
+    qd_conv_t qkv, proj;
+} qd_attn_t;
 
-    /* Activations, sized by dv_ensure() */
+struct qv_dev {
+    qd_conv_t quant, conv_in, conv_out;
+    qd_res_t mid_res[2];
+    qd_attn_t attn;
+    qd_res_t res[QV_MAX_LEVELS][QV_MAX_RES];
+    qd_conv_t conv[QV_MAX_LEVELS];
+    float *norm_out;
+
+    /* Activations, sized by dv_buffers() */
     float *buf[4];           /* x, y, t1, t2 */
-    float *skip;             /* input of an upsampling block */
-    uint16_t *attn;          /* q, k, v, out */
+    float *skip;             /* input of a resampling block */
+    uint16_t *attn_buf;      /* q, k, v, out */
     size_t buf_elems, skip_elems, attn_elems;
 };
 
@@ -360,72 +478,59 @@ static void dv_free_buffers(struct qv_dev *d) {
         d->buf[i] = NULL;
     }
     iris_dev_free(d->skip);
-    iris_dev_free(d->attn);
+    iris_dev_free(d->attn_buf);
     d->skip = NULL;
-    d->attn = NULL;
+    d->attn_buf = NULL;
     d->buf_elems = d->skip_elems = d->attn_elems = 0;
 }
 
-static void dv_free(iris_vae_qimage_t *vae) {
-    struct qv_dev *d = vae->dev;
+static void dv_free(qv_net_t *n) {
+    struct qv_dev *d = n->dev;
     if (!d) return;
-    dv_free_conv(&d->post_quant);
+    dv_free_conv(&d->quant);
     dv_free_conv(&d->conv_in);
     dv_free_conv(&d->conv_out);
-    dv_free_conv(&d->attn_qkv);
-    dv_free_conv(&d->attn_proj);
+    dv_free_conv(&d->attn.qkv);
+    dv_free_conv(&d->attn.proj);
     dv_free_res(&d->mid_res[0]);
     dv_free_res(&d->mid_res[1]);
-    for (int i = 0; i < vae->num_up; i++) {
-        for (int r = 0; r < vae->up[i].num_res; r++) dv_free_res(&d->res[i][r]);
-        dv_free_conv(&d->up_conv[i]);
+    for (int i = 0; i < n->num_blocks; i++) {
+        for (int r = 0; r < n->block[i].num_res; r++) dv_free_res(&d->res[i][r]);
+        dv_free_conv(&d->conv[i]);
     }
-    iris_dev_free(d->attn_gamma);
+    iris_dev_free(d->attn.gamma);
     iris_dev_free(d->norm_out);
     dv_free_buffers(d);
     free(d);
-    vae->dev = NULL;
+    n->dev = NULL;
 }
 
-static int dv_load(iris_vae_qimage_t *vae) {
+static int dv_load(qv_net_t *n) {
     struct qv_dev *d = calloc(1, sizeof(*d));
     if (!d) return 0;
-    vae->dev = d;
-    int top = vae->mid_res[0].cout, last = vae->up[vae->num_up - 1].cout;
-    int ok = dv_conv(&d->post_quant, &vae->post_quant) && dv_conv(&d->conv_in, &vae->conv_in) &&
-             dv_conv(&d->conv_out, &vae->conv_out) && dv_conv(&d->attn_qkv, &vae->attn_qkv) &&
-             dv_conv(&d->attn_proj, &vae->attn_proj) && dv_res(&d->mid_res[0], &vae->mid_res[0]) &&
-             dv_res(&d->mid_res[1], &vae->mid_res[1]);
-    for (int i = 0; ok && i < vae->num_up; i++) {
-        for (int r = 0; ok && r < vae->up[i].num_res; r++)
-            ok = dv_res(&d->res[i][r], &vae->up[i].res[r]);
-        ok = ok && dv_conv(&d->up_conv[i], &vae->up[i].up_conv);
+    n->dev = d;
+    int top = n->mid_res[0].cout, last = n->conv_out.cin;
+    int ok = dv_conv(&d->quant, &n->quant) && dv_conv(&d->conv_in, &n->conv_in) &&
+             dv_conv(&d->conv_out, &n->conv_out) && dv_conv(&d->attn.qkv, &n->attn.qkv) &&
+             dv_conv(&d->attn.proj, &n->attn.proj) && dv_res(&d->mid_res[0], &n->mid_res[0]) &&
+             dv_res(&d->mid_res[1], &n->mid_res[1]);
+    for (int i = 0; ok && i < n->num_blocks; i++) {
+        for (int r = 0; ok && r < n->block[i].num_res; r++)
+            ok = dv_res(&d->res[i][r], &n->block[i].res[r]);
+        ok = ok && dv_conv(&d->conv[i], &n->block[i].conv);
     }
-    d->attn_gamma = ok ? dv_f32(vae->attn_gamma, top) : NULL;
-    d->norm_out = ok ? dv_f32(vae->norm_out, last) : NULL;
-    if (!d->attn_gamma || !d->norm_out) {
-        dv_free(vae);
+    d->attn.gamma = ok ? dv_f32(n->attn.gamma, top) : NULL;
+    d->norm_out = ok ? dv_f32(n->norm_out, last) : NULL;
+    if (!d->attn.gamma || !d->norm_out) {
+        dv_free(n);
         return 0;
     }
     iris_dev_sync();
     return 1;
 }
 
-/* Size the activations for a latent of h x w pixels. */
-static int dv_ensure(iris_vae_qimage_t *vae, int h, int w) {
-    struct qv_dev *d = vae->dev;
-    size_t hw = (size_t)h * w, top = vae->mid_res[0].cout;
-    size_t need = hw * 3 * top, skip = 0, attn = hw * 4 * top;
-    for (int i = 0; i < vae->num_up; i++) {
-        const qv_up_t *u = &vae->up[i];
-        size_t c = u->cin > u->cout ? u->cin : u->cout;
-        if (hw * c > need) need = hw * c;
-        if (u->upsample) {
-            if (hw * u->cin > skip) skip = hw * u->cin;
-            hw *= 4;
-            if (hw * u->cout > need) need = hw * u->cout;
-        }
-    }
+/* Grow the activations to these element counts. */
+static int dv_buffers(struct qv_dev *d, size_t need, size_t skip, size_t attn) {
     if (need <= d->buf_elems && skip <= d->skip_elems && attn <= d->attn_elems) return 1;
     dv_free_buffers(d);
     int ok = 1;
@@ -434,8 +539,8 @@ static int dv_ensure(iris_vae_qimage_t *vae, int h, int w) {
         ok = ok && d->buf[i];
     }
     d->skip = iris_dev_alloc(skip * sizeof(float));
-    d->attn = iris_dev_alloc(attn * sizeof(uint16_t));
-    if (!ok || !d->skip || !d->attn) {
+    d->attn_buf = iris_dev_alloc(attn * sizeof(uint16_t));
+    if (!ok || !d->skip || !d->attn_buf) {
         dv_free_buffers(d);
         return 0;
     }
@@ -443,6 +548,36 @@ static int dv_ensure(iris_vae_qimage_t *vae, int h, int w) {
     d->skip_elems = skip;
     d->attn_elems = attn;
     return 1;
+}
+
+/* Size the decoder activations for a latent of h x w pixels. */
+static int dv_ensure(qv_net_t *n, int h, int w) {
+    size_t hw = (size_t)h * w, top = n->mid_res[0].cout;
+    size_t need = hw * 3 * top, skip = 0, attn = hw * 4 * top;
+    for (int i = 0; i < n->num_blocks; i++) {
+        const qv_block_t *u = &n->block[i];
+        size_t c = u->cin > u->cout ? u->cin : u->cout;
+        if (hw * c > need) need = hw * c;
+        if (u->resample) {
+            if (hw * u->cin > skip) skip = hw * u->cin;
+            hw *= 4;
+            if (hw * u->cout > need) need = hw * u->cout;
+        }
+    }
+    return dv_buffers(n->dev, need, skip, attn);
+}
+
+/* Size the encoder activations for an image of h x w pixels. */
+static int dv_ensure_enc(qv_net_t *n, int h, int w) {
+    size_t hw = (size_t)h * w, top = n->mid_res[0].cout, need = 0;
+    for (int i = 0; i < n->num_blocks; i++) {
+        const qv_block_t *b = &n->block[i];
+        size_t c = b->cin > b->cout ? b->cin : b->cout;
+        if (hw * c > need) need = hw * c;
+        if (b->resample) hw /= 4;
+    }
+    if (hw * 3 * top > need) need = hw * 3 * top;
+    return dv_buffers(n->dev, need, need, hw * 4 * top);
 }
 
 static void dv_conv2d(float *out, const float *in, const qd_conv_t *d, const qv_conv_t *c,
@@ -467,37 +602,34 @@ static void dv_res_forward(const qd_res_t *d, const qv_res_t *r, float *out, con
 }
 
 /* Single-head self-attention over the n pixels, plus the residual. */
-static void dv_attention(iris_vae_qimage_t *vae, float *out, const float *x, float *t1,
+static void dv_attention(const qv_net_t *net, float *out, const float *x, float *t1,
                          float *t2, int n, int c) {
-    struct qv_dev *d = vae->dev;
-    uint16_t *qkv = d->attn, *o = qkv + (size_t)n * 3 * c;
-    iris_dev_pixel_rms_norm(t1, x, d->attn_gamma, n, c, 0);
-    dv_conv2d(t2, t1, &d->attn_qkv, &vae->attn_qkv, n, 1);
+    const qd_attn_t *a = &net->dev->attn;
+    uint16_t *qkv = net->dev->attn_buf, *o = qkv + (size_t)n * 3 * c;
+    iris_dev_pixel_rms_norm(t1, x, a->gamma, n, c, 0);
+    dv_conv2d(t2, t1, &a->qkv, &net->attn.qkv, n, 1);
     iris_dev_f32_to_bf16(qkv, t2, (size_t)n * 3 * c);
     iris_dev_attention(o, c, qkv, qkv + c, qkv + 2 * c, 3 * c, n, n, 1, 1, c,
                        1.0f / sqrtf((float)c), 0, NULL);
-    iris_dev_linear_f32(out, o, d->attn_proj.w, n, c, c);
-    iris_dev_add_bias(out, d->attn_proj.b, n, c);
+    iris_dev_linear_f32(out, o, a->proj.w, n, c, c);
+    iris_dev_add_bias(out, a->proj.b, n, c);
     iris_dev_add(out, x, (size_t)n * c);
 }
 
 int iris_vae_reserve_qimage(iris_vae_qimage_t *vae, int h, int w) {
     if (!iris_dev_available()) return 1;
-    if (!vae->dev && !dv_load(vae)) return 0;
-    return dv_ensure(vae, h, w);
-}
-
-void iris_vae_release_qimage(iris_vae_qimage_t *vae) {
-    if (vae->dev) dv_free_buffers(vae->dev);
+    if (!vae->dec.dev && !dv_load(&vae->dec)) return 0;
+    return dv_ensure(&vae->dec, h, w);
 }
 
 static iris_image *decode_dev(iris_vae_qimage_t *vae, const float *latent, int h, int w) {
     if (!iris_vae_reserve_qimage(vae, h, w)) return NULL;
-    struct qv_dev *d = vae->dev;
+    const qv_net_t *n = &vae->dec;
+    struct qv_dev *d = n->dev;
     float *x = d->buf[0], *y = d->buf[1], *t1 = d->buf[2], *t2 = d->buf[3], *tmp;
 #define DV_SWAP() (tmp = x, x = y, y = tmp)
 
-    int z = vae->z_dim, top = vae->mid_res[0].cout;
+    int z = vae->z_dim, top = n->mid_res[0].cout;
     size_t hw = (size_t)h * w;
     float *host = malloc((size_t)z * hw * sizeof(float));
     if (!host) return NULL;
@@ -507,37 +639,37 @@ static iris_image *decode_dev(iris_vae_qimage_t *vae, const float *latent, int h
     iris_dev_upload(x, host, (size_t)z * hw * sizeof(float));
     free(host);
 
-    dv_conv2d(y, x, &d->post_quant, &vae->post_quant, h, w);
-    dv_conv2d(x, y, &d->conv_in, &vae->conv_in, h, w);
-    dv_res_forward(&d->mid_res[0], &vae->mid_res[0], y, x, t1, t2, h, w);
-    dv_attention(vae, x, y, t1, t2, (int)hw, top);
-    dv_res_forward(&d->mid_res[1], &vae->mid_res[1], y, x, t1, t2, h, w);
+    dv_conv2d(y, x, &d->quant, &n->quant, h, w);
+    dv_conv2d(x, y, &d->conv_in, &n->conv_in, h, w);
+    dv_res_forward(&d->mid_res[0], &n->mid_res[0], y, x, t1, t2, h, w);
+    dv_attention(n, x, y, t1, t2, (int)hw, top);
+    dv_res_forward(&d->mid_res[1], &n->mid_res[1], y, x, t1, t2, h, w);
     DV_SWAP();
 
-    for (int i = 0; i < vae->num_up; i++) {
-        const qv_up_t *u = &vae->up[i];
+    for (int i = 0; i < n->num_blocks; i++) {
+        const qv_block_t *u = &n->block[i];
         /* A byte copy of the block input for the DupUp shortcut. */
-        if (u->upsample)
+        if (u->resample)
             iris_dev_copy_2d((uint16_t *)d->skip, 2 * u->cin, (const uint16_t *)x, 2 * u->cin,
                              h * w, 2 * u->cin);
         for (int r = 0; r < u->num_res; r++) {
             dv_res_forward(&d->res[i][r], &u->res[r], y, x, t1, t2, h, w);
             DV_SWAP();
         }
-        if (u->upsample) {
+        if (u->resample) {
             iris_dev_upsample2x(y, x, h, w, u->cout);
-            dv_conv2d(x, y, &d->up_conv[i], &u->up_conv, 2 * h, 2 * w);
+            dv_conv2d(x, y, &d->conv[i], &u->conv, 2 * h, 2 * w);
             iris_dev_dup_up_add(x, d->skip, h, w, u->cin, u->cout, u->factor_t);
             h *= 2;
             w *= 2;
         }
-        if (iris_vae_progress_callback) iris_vae_progress_callback(i + 1, vae->num_up);
+        if (iris_vae_progress_callback) iris_vae_progress_callback(i + 1, n->num_blocks);
     }
 #undef DV_SWAP
 
-    int c = vae->up[vae->num_up - 1].cout, channels = vae->out_channels;
+    int c = n->conv_out.cin, channels = vae->out_channels;
     iris_dev_pixel_rms_norm(y, x, d->norm_out, h * w, c, 1);
-    dv_conv2d(t1, y, &d->conv_out, &vae->conv_out, h, w);
+    dv_conv2d(t1, y, &d->conv_out, &n->conv_out, h, w);
 
     hw = (size_t)h * w;
     float *hwc = malloc((size_t)channels * hw * sizeof(float));
@@ -553,14 +685,87 @@ static iris_image *decode_dev(iris_vae_qimage_t *vae, const float *latent, int h
     free(rgba);
     return img;
 }
+
+/* The encoder on the device: the mean [z, h', w'] (caller frees), or NULL. */
+static float *encode_dev(const iris_vae_qimage_t *vae, const float *rgba, int h, int w) {
+    qv_net_t *n = vae->enc;
+    if (!n->dev && !dv_load(n)) return NULL;
+    if (!dv_ensure_enc(n, h, w)) return NULL;
+    struct qv_dev *d = n->dev;
+    float *x = d->buf[0], *y = d->buf[1], *z = d->skip, *t1 = d->buf[2], *t2 = d->buf[3];
+
+    int cin = n->conv_in.cin;
+    size_t hw = (size_t)h * w;
+    float *hwc = malloc((size_t)cin * hw * sizeof(float));
+    if (!hwc) return NULL;
+    for (int c = 0; c < cin; c++)
+        for (size_t p = 0; p < hw; p++) hwc[p * cin + c] = rgba[c * hw + p];
+    iris_dev_upload(x, hwc, (size_t)cin * hw * sizeof(float));
+    free(hwc);
+
+    dv_conv2d(y, x, &d->conv_in, &n->conv_in, h, w);
+    float *tmp = x;
+    x = y;
+    y = tmp;
+    QD_STAGE("conv_in", -1, x, n->conv_in.cout, h, w);
+
+    /* x stays the block input; the res blocks alternate between y and z. */
+    for (int i = 0; i < n->num_blocks; i++) {
+        const qv_block_t *b = &n->block[i];
+        float *src = x;
+        for (int r = 0; r < b->num_res; r++) {
+            dv_res_forward(&d->res[i][r], &b->res[r], y, src, t1, t2, h, w);
+            tmp = src == x ? z : src;
+            src = y;
+            y = tmp;
+        }
+        if (b->resample) {
+            iris_dev_conv2d(y, src, d->conv[i].w, d->conv[i].b, h, w, b->cout, b->cout,
+                            b->conv.k, 2, 0, 1);
+            iris_dev_avg_down_add(y, x, h, w, b->cin, b->cout, b->factor_t);
+            h /= 2;
+            w /= 2;
+            tmp = x;
+            x = y;
+            y = src;
+            z = tmp;
+        } else {
+            iris_dev_add(src, x, (size_t)h * w * b->cout);
+            tmp = x;
+            x = src;
+            z = tmp;
+        }
+        QD_STAGE("down", i, x, b->cout, h, w);
+    }
+
+    int top = n->mid_res[0].cout;
+    hw = (size_t)h * w;
+    dv_res_forward(&d->mid_res[0], &n->mid_res[0], y, x, t1, t2, h, w);
+    dv_attention(n, x, y, t1, t2, (int)hw, top);
+    dv_res_forward(&d->mid_res[1], &n->mid_res[1], y, x, t1, t2, h, w);
+    QD_STAGE("mid", -1, y, top, h, w);
+    iris_dev_pixel_rms_norm(x, y, d->norm_out, (int)hw, top, 1);
+    QD_STAGE("norm_out", -1, x, top, h, w);
+    dv_conv2d(y, x, &d->conv_out, &n->conv_out, h, w);
+    QD_STAGE("conv_out", -1, y, n->conv_out.cout, h, w);
+    dv_conv2d(x, y, &d->quant, &n->quant, h, w);
+    QD_STAGE("quant", -1, x, n->quant.cout, h, w);
+
+    int moments = n->quant.cout, zc = vae->z_dim;
+    float *out = malloc((size_t)zc * hw * sizeof(float));
+    hwc = malloc((size_t)moments * hw * sizeof(float));
+    if (out && hwc) {
+        iris_dev_download(hwc, x, (size_t)moments * hw * sizeof(float));
+        for (int c = 0; c < zc; c++)
+            for (size_t p = 0; p < hw; p++) out[c * hw + p] = hwc[p * moments + c];
+    }
+    free(hwc);
+    return out;
+}
 #else
 int iris_vae_reserve_qimage(iris_vae_qimage_t *vae, int h, int w) {
     (void)vae, (void)h, (void)w;
     return 1;
-}
-
-void iris_vae_release_qimage(iris_vae_qimage_t *vae) {
-    (void)vae;
 }
 #endif /* IRIS_DEV */
 
@@ -583,23 +788,24 @@ iris_image *iris_vae_decode_qimage(iris_vae_qimage_t *vae, const float *latent,
         for (size_t p = 0; p < hw; p++)
             z[c * hw + p] = latent[c * hw + p] * vae->std[c] + vae->mean[c];
 
-    float *x = conv(&vae->post_quant, z, h, w);
+    const qv_net_t *n = &vae->dec;
+    float *x = conv(&n->quant, z, h, w);
     free(z);
-    z = conv(&vae->conv_in, x, h, w);
+    z = conv(&n->conv_in, x, h, w);
     free(x);
-    x = res_forward(&vae->mid_res[0], z, h, w, 1);
-    mid_attention(vae, x, vae->mid_res[0].cout, h, w);
-    x = res_forward(&vae->mid_res[1], x, h, w, 1);
+    x = res_forward(&n->mid_res[0], z, h, w, 1);
+    mid_attention(&n->attn, x, n->mid_res[0].cout, h, w);
+    x = res_forward(&n->mid_res[1], x, h, w, 1);
 
     int oh = h, ow = w;
-    for (int i = 0; i < vae->num_up; i++) {
-        x = up_forward(&vae->up[i], x, &oh, &ow);
-        if (iris_vae_progress_callback) iris_vae_progress_callback(i + 1, vae->num_up);
+    for (int i = 0; i < n->num_blocks; i++) {
+        x = up_forward(&n->block[i], x, &oh, &ow);
+        if (iris_vae_progress_callback) iris_vae_progress_callback(i + 1, n->num_blocks);
     }
 
-    int c = vae->up[vae->num_up - 1].cout;
-    pixel_rms_norm(x, vae->norm_out, c, oh * ow, 1);
-    float *rgba = conv(&vae->conv_out, x, oh, ow);
+    int c = n->conv_out.cin;
+    pixel_rms_norm(x, n->norm_out, c, oh * ow, 1);
+    float *rgba = conv(&n->conv_out, x, oh, ow);
     free(x);
 
     iris_image *img = rgba_to_image(rgba, vae->out_channels, oh, ow);
@@ -699,6 +905,37 @@ static int load_res(safetensors_file_t *sf, qv_res_t *r, const char *prefix, int
     return ok;
 }
 
+/* The res blocks and the resampling convolution of a block. */
+static int load_block(safetensors_file_t *sf, qv_block_t *b, const char *prefix,
+                      const char *sampler) {
+    char name[256];
+    int ok = 1;
+    for (int r = 0; ok && r < b->num_res; r++) {
+        snprintf(name, sizeof(name), "%s.resnets.%d", prefix, r);
+        ok = load_res(sf, &b->res[r], name, r ? b->cout : b->cin, b->cout);
+    }
+    if (ok && b->resample) {
+        snprintf(name, sizeof(name), "%s.%s.resample.1", prefix, sampler);
+        ok = load_conv(sf, &b->conv, name, b->cout, b->cout, 3);
+    }
+    return ok;
+}
+
+/* Mid block of a direction ("decoder" or "encoder"). */
+static int load_mid(safetensors_file_t *sf, qv_net_t *n, const char *dir, int c) {
+    char name[256];
+    snprintf(name, sizeof(name), "%s.mid_block.resnets.0", dir);
+    int ok = load_res(sf, &n->mid_res[0], name, c, c);
+    snprintf(name, sizeof(name), "%s.mid_block.resnets.1", dir);
+    ok = ok && load_res(sf, &n->mid_res[1], name, c, c);
+    snprintf(name, sizeof(name), "%s.mid_block.attentions.0.to_qkv", dir);
+    ok = ok && load_conv(sf, &n->attn.qkv, name, c, 3 * c, 1);
+    snprintf(name, sizeof(name), "%s.mid_block.attentions.0.proj", dir);
+    ok = ok && load_conv(sf, &n->attn.proj, name, c, c, 1);
+    snprintf(name, sizeof(name), "%s.mid_block.attentions.0.norm.gamma", dir);
+    return ok && (n->attn.gamma = load_f32(sf, name, c)) != NULL;
+}
+
 static void free_conv(qv_conv_t *c) {
     free(c->w);
     free(c->b);
@@ -710,6 +947,25 @@ static void free_res(qv_res_t *r) {
     free_conv(&r->conv1);
     free_conv(&r->conv2);
     free_conv(&r->shortcut);
+}
+
+static void free_net(qv_net_t *n) {
+#ifdef IRIS_DEV
+    dv_free(n);
+#endif
+    free_conv(&n->quant);
+    free_conv(&n->conv_in);
+    free_conv(&n->conv_out);
+    free_res(&n->mid_res[0]);
+    free_res(&n->mid_res[1]);
+    free(n->attn.gamma);
+    free_conv(&n->attn.qkv);
+    free_conv(&n->attn.proj);
+    for (int i = 0; i < n->num_blocks; i++) {
+        for (int r = 0; r < n->block[i].num_res; r++) free_res(&n->block[i].res[r]);
+        free_conv(&n->block[i].conv);
+    }
+    free(n->norm_out);
 }
 
 /* Load the decoder from <model_dir>/vae (config.json and the weights). */
@@ -739,13 +995,18 @@ iris_vae_qimage_t *iris_vae_load_qimage(const char *model_dir) {
     int patch = (int)json_num(cfg, "patch_size", 1);
     vae->z_dim = (int)json_num(cfg, "z_dim", 64);
     vae->out_channels = (int)json_num(cfg, "out_channels", 4);
+    vae->in_channels = (int)json_num(cfg, "in_channels", 4);
+    vae->enc_res = num_res - 1;
+    vae->levels = levels;
+    int enc_base = (int)json_num(cfg, "base_dim", 96);
     int nmean = json_array(cfg, "latents_mean", vae->mean, QV_MAX_CH);
     int nstd = json_array(cfg, "latents_std", vae->std, QV_MAX_CH);
     free(cfg);
 
     if (levels < 2 || ntdown != levels - 1 || !residual || patch > 1 ||
         num_res > QV_MAX_RES || vae->z_dim > QV_MAX_CH || nmean != vae->z_dim ||
-        nstd != vae->z_dim || (vae->out_channels != 3 && vae->out_channels != 4)) {
+        nstd != vae->z_dim || (vae->out_channels != 3 && vae->out_channels != 4) ||
+        (vae->in_channels != 3 && vae->in_channels != 4)) {
         fprintf(stderr, "Qwen-Image VAE: unsupported config in %s\n", path);
         free(vae);
         return NULL;
@@ -765,49 +1026,42 @@ iris_vae_qimage_t *iris_vae_load_qimage(const char *model_dir) {
     for (int i = 0; i < levels; i++) dims[i + 1] = base * (int)dim_mult[levels - 1 - i];
     int top = dims[0], z = vae->z_dim;
 
-    int ok = load_conv(sf, &vae->post_quant, "post_quant_conv", z, z, 1) &&
-             load_conv(sf, &vae->conv_in, "decoder.conv_in", z, top, 3) &&
-             load_res(sf, &vae->mid_res[0], "decoder.mid_block.resnets.0", top, top) &&
-             load_res(sf, &vae->mid_res[1], "decoder.mid_block.resnets.1", top, top) &&
-             load_conv(sf, &vae->attn_qkv, "decoder.mid_block.attentions.0.to_qkv",
-                       top, 3 * top, 1) &&
-             load_conv(sf, &vae->attn_proj, "decoder.mid_block.attentions.0.proj",
-                       top, top, 1);
-    if (ok) {
-        vae->attn_gamma = load_f32(sf, "decoder.mid_block.attentions.0.norm.gamma", top);
-        ok = vae->attn_gamma != NULL;
+    /* Encoder widths, for its lazy load: one width per block input, then the
+     * last block's output; the last block does not downsample. */
+    vae->enc_dims[0] = enc_base;
+    for (int i = 0; i < levels; i++) {
+        vae->enc_dims[i + 1] = enc_base * (int)dim_mult[i];
+        vae->enc_ft[i] = i < levels - 1 && tdown[i] != 0 ? 2 : 1;
     }
+    vae->dir = strdup(model_dir);
+
+    qv_net_t *n = &vae->dec;
+    int ok = load_conv(sf, &n->quant, "post_quant_conv", z, z, 1) &&
+             load_conv(sf, &n->conv_in, "decoder.conv_in", z, top, 3) &&
+             load_mid(sf, n, "decoder", top);
 
     /* Up blocks; temperal_upsample is temperal_downsample reversed. */
-    vae->num_up = levels;
     char name[256];
     for (int i = 0; ok && i < levels; i++) {
-        qv_up_t *u = &vae->up[i];
+        qv_block_t *u = &n->block[n->num_blocks++];
         u->cin = dims[i];
         u->cout = dims[i + 1];
         u->num_res = num_res;
-        u->upsample = i != levels - 1;
-        u->factor_t = (u->upsample && tdown[levels - 2 - i] != 0) ? 2 : 1;
-        for (int r = 0; ok && r < num_res; r++) {
-            snprintf(name, sizeof(name), "decoder.up_blocks.%d.resnets.%d", i, r);
-            ok = load_res(sf, &u->res[r], name, r ? u->cout : u->cin, u->cout);
+        u->resample = i != levels - 1;
+        u->factor_t = (u->resample && tdown[levels - 2 - i] != 0) ? 2 : 1;
+        if (u->resample && (u->cout * u->factor_t * 4) % u->cin) {
+            fprintf(stderr, "Qwen-Image VAE: up block %d widths %d -> %d\n", i, u->cin, u->cout);
+            ok = 0;
+            break;
         }
-        if (ok && u->upsample) {
-            if ((u->cout * u->factor_t * 4) % u->cin) {
-                fprintf(stderr, "Qwen-Image VAE: up block %d widths %d -> %d\n",
-                        i, u->cin, u->cout);
-                ok = 0;
-                break;
-            }
-            snprintf(name, sizeof(name), "decoder.up_blocks.%d.upsampler.resample.1", i);
-            ok = load_conv(sf, &u->up_conv, name, u->cout, u->cout, 3);
-        }
+        snprintf(name, sizeof(name), "decoder.up_blocks.%d", i);
+        ok = load_block(sf, u, name, "upsampler");
     }
     if (ok) {
         int last = dims[levels];
-        vae->norm_out = load_f32(sf, "decoder.norm_out.gamma", last);
-        ok = vae->norm_out &&
-             load_conv(sf, &vae->conv_out, "decoder.conv_out", last, vae->out_channels, 3);
+        n->norm_out = load_f32(sf, "decoder.norm_out.gamma", last);
+        ok = n->norm_out &&
+             load_conv(sf, &n->conv_out, "decoder.conv_out", last, vae->out_channels, 3);
     }
     safetensors_close(sf);
 
@@ -821,23 +1075,97 @@ iris_vae_qimage_t *iris_vae_load_qimage(const char *model_dir) {
     return vae;
 }
 
+/* Load the encoder from the file the decoder came from. */
+static qv_net_t *load_encoder(const iris_vae_qimage_t *vae) {
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/vae/diffusion_pytorch_model.safetensors", vae->dir);
+    safetensors_file_t *sf = safetensors_open(path);
+    if (!sf) {
+        fprintf(stderr, "Qwen-Image VAE: cannot open %s\n", path);
+        return NULL;
+    }
+    qv_net_t *n = calloc(1, sizeof(*n));
+    const int *dims = vae->enc_dims;
+    int top = dims[vae->levels], moments = 2 * vae->z_dim;
+    int ok = load_conv(sf, &n->quant, "quant_conv", moments, moments, 1) &&
+             load_conv(sf, &n->conv_in, "encoder.conv_in", vae->in_channels, dims[0], 3) &&
+             load_mid(sf, n, "encoder", top);
+    char name[256];
+    for (int i = 0; ok && i < vae->levels; i++) {
+        qv_block_t *b = &n->block[n->num_blocks++];
+        b->cin = dims[i];
+        b->cout = dims[i + 1];
+        b->num_res = vae->enc_res;
+        b->resample = i != vae->levels - 1;
+        b->factor_t = vae->enc_ft[i];
+        if (b->resample && (b->cin * b->factor_t * 4) % b->cout) {
+            fprintf(stderr, "Qwen-Image VAE: down block %d widths %d -> %d\n", i, b->cin, b->cout);
+            ok = 0;
+            break;
+        }
+        snprintf(name, sizeof(name), "encoder.down_blocks.%d", i);
+        ok = load_block(sf, b, name, "downsampler");
+    }
+    if (ok) {
+        n->norm_out = load_f32(sf, "encoder.norm_out.gamma", top);
+        ok = n->norm_out && load_conv(sf, &n->conv_out, "encoder.conv_out", top, moments, 3);
+    }
+    safetensors_close(sf);
+    if (!ok) {
+        free_net(n);
+        free(n);
+        return NULL;
+    }
+    return n;
+}
+
+static void free_encoder(iris_vae_qimage_t *vae) {
+    if (!vae->enc) return;
+    free_net(vae->enc);
+    free(vae->enc);
+    vae->enc = NULL;
+}
+
+/* ========================================================================
+ * Encode
+ * ======================================================================== */
+
+float *iris_vae_encode_qimage(iris_vae_qimage_t *vae, const float *rgba, int h, int w) {
+    int scale = 1 << (vae->levels - 1);
+    if (h % scale || w % scale) {
+        fprintf(stderr, "Qwen-Image VAE: %dx%d is not a multiple of %d\n", w, h, scale);
+        return NULL;
+    }
+    if (!vae->enc && !(vae->enc = load_encoder(vae))) return NULL;
+
+    float *z = NULL;
+#ifdef IRIS_DEV
+    if (iris_dev_available()) {
+        z = encode_dev(vae, rgba, h, w);
+        if (!z) fprintf(stderr, "Qwen-Image VAE: GPU encode failed, using the CPU\n");
+    }
+#endif
+    if (!z) z = encode_host(vae->enc, rgba, h, w);
+
+    /* The posterior's mode is its mean, the first z_dim channels. */
+    size_t hw = (size_t)(h / scale) * (w / scale);
+    for (int c = 0; c < vae->z_dim; c++)
+        for (size_t p = 0; p < hw; p++)
+            z[c * hw + p] = (z[c * hw + p] - vae->mean[c]) / vae->std[c];
+    return z;
+}
+
+void iris_vae_release_qimage(iris_vae_qimage_t *vae) {
+#ifdef IRIS_DEV
+    if (vae->dec.dev) dv_free_buffers(vae->dec.dev);
+#endif
+    free_encoder(vae);
+}
+
 void iris_vae_free_qimage(iris_vae_qimage_t *vae) {
     if (!vae) return;
-#ifdef IRIS_DEV
-    dv_free(vae);
-#endif
-    free_conv(&vae->post_quant);
-    free_conv(&vae->conv_in);
-    free_conv(&vae->conv_out);
-    free_res(&vae->mid_res[0]);
-    free_res(&vae->mid_res[1]);
-    free(vae->attn_gamma);
-    free_conv(&vae->attn_qkv);
-    free_conv(&vae->attn_proj);
-    for (int i = 0; i < vae->num_up; i++) {
-        for (int r = 0; r < vae->up[i].num_res; r++) free_res(&vae->up[i].res[r]);
-        free_conv(&vae->up[i].up_conv);
-    }
-    free(vae->norm_out);
+    free_encoder(vae);
+    free_net(&vae->dec);
+    free(vae->dir);
     free(vae);
 }

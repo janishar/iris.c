@@ -63,7 +63,7 @@ iris_transformer_flux.c   - Flux diffusion transformer (MMDiT)
 iris_transformer_zimage.c - Z-Image transformer (S3-DiT)
 iris_transformer_flux3.c  - FLUX.3 transformer (per-mode + joint blocks)
 iris_transformer_qimage.c - Qwen-Image 2.1 transformer (single-stream, text prefix KV)
-iris_vae_qimage.c         - Qwen-Image 2.1 VAE decoder (Wan-derived, 2D)
+iris_vae_qimage.c         - Qwen-Image 2.1 VAE (Wan-derived, 2D)
 iris_qimage.h             - Qwen-Image internal API (scheduler, transformer, VAE)
 iris_sample.c             - Sampling/denoising loops (Euler ODE)
 iris_qwen3.c              - Qwen3 text encoder
@@ -494,9 +494,16 @@ theta 10000 (hardcoded upstream), eps 1e-6, causal_condition=true. No biases.
   step runs only image tokens against them.
 - Scheduler: FlowMatchEulerDiscreteScheduler settings read from
   `scheduler/scheduler_config.json`, applied to Turbo's sample_sigmas too.
-- VAE: decoder only, 2D convs, per-pixel RMS norms (F.normalize * sqrt(C) *
-  gamma), residual up blocks with a DupUp shortcut, mid single-head attention,
-  RGBA out. Latent denorm `z * std + mean` (64 values each from config).
+- VAE: 2D convs, per-pixel RMS norms (F.normalize * sqrt(C) * gamma), residual
+  up blocks with a DupUp shortcut, mid single-head attention, RGBA out. Latent
+  denorm `z * std + mean` (64 values each from config). The encoder mirrors it
+  (down conv pads right and bottom by 1, AvgDown shortcut), is loaded at the
+  first encode and freed by iris_vae_release_qimage(); the latent is the
+  normalized posterior mean.
+- Reference preparation (iris_image.c): RGBA, 32-px grid with Python's round,
+  premultiplied Lanczos, vision copy over white. iris_image_resize keeps floats
+  between its passes where PIL rounds to 8 bits, so expect RMS 0.3-0.4/255 on
+  opaque images and more at very low alpha, where unpremultiplying amplifies it.
 
 # Qwen-Image Text Encoder
 

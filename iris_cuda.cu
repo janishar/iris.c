@@ -1137,3 +1137,26 @@ extern "C" void iris_dev_dup_up_add(float *out, const float *in, int h, int widt
     if (n) k_dup_up_add<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(out, in, width, cin, cout, ft,
                                                                    cout * ft * 4 / cin, n);
 }
+
+__global__ void k_avg_down_add(float *out, const float *in, int w, int cin, int cout, int ft,
+                               int group, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int o = (int)(i % cout);
+    size_t p = i / cout;
+    int x = (int)(p % (w / 2)), y = (int)(p / (w / 2));
+    float s = 0;
+    for (int g = 0; g < group; g++) {
+        int idx = o * group + g, rest = idx >> 2;
+        if (rest % ft == ft - 1)
+            s += in[((size_t)(2 * y + ((idx >> 1) & 1)) * w + 2 * x + (idx & 1)) * cin + rest / ft];
+    }
+    out[i] += s / group;
+}
+
+extern "C" void iris_dev_avg_down_add(float *out, const float *in, int h, int width, int cin,
+                                      int cout, int ft) {
+    size_t n = (size_t)(h / 2) * (width / 2) * cout;
+    if (n) k_avg_down_add<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(out, in, width, cin, cout, ft,
+                                                                     cin * ft * 4 / cout, n);
+}

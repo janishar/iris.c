@@ -1,6 +1,6 @@
 /*
  * Qwen-Image 2.1 (base and Turbo): internal API shared by iris.c and the
- * Qwen-Image components (scheduler, transformer, VAE decoder).
+ * Qwen-Image components (scheduler, transformer, VAE).
  */
 
 #ifndef IRIS_QIMAGE_H
@@ -18,6 +18,25 @@
  * the VAE decoder needs about 22 GB of GPU activations at 4 MP. */
 #define IRIS_QIMAGE_MAX_DIM    2816
 #define IRIS_QIMAGE_MAX_PIXELS (2752 * 1536)
+
+/* Reference images are prepared at this area (1024 x 1024). */
+#define IRIS_QIMAGE_REF_AREA (1024 * 1024)
+
+/* ========================================================================
+ * Reference preparation (iris_image.c)
+ * ======================================================================== */
+
+/* Size of a width x height reference at about area pixels, on a 32-pixel grid. */
+void iris_ref_size_qimage(int width, int height, int area, int *ref_w, int *ref_h);
+
+/* RGBA copy of img at its reference size. */
+iris_image *iris_ref_prepare_qimage(const iris_image *img, int area);
+
+/* Vision encoder RGB copy of a prepared reference, over white. */
+iris_image *iris_ref_vision_qimage(const iris_image *rgba);
+
+/* VAE input of a prepared reference: [4, h, w] in [-1, 1] (caller frees). */
+float *iris_ref_pixels_qimage(const iris_image *rgba);
 
 /* ========================================================================
  * Scheduler (iris_sample.c)
@@ -69,7 +88,7 @@ float *iris_transformer_forward_qimage(iris_transformer_qimage_t *tf,
                                        const float *x, int h, int w, float sigma);
 
 /* ========================================================================
- * VAE decoder (iris_vae_qimage.c)
+ * VAE (iris_vae_qimage.c)
  * ======================================================================== */
 
 typedef struct iris_vae_qimage iris_vae_qimage_t;
@@ -81,8 +100,13 @@ void iris_vae_free_qimage(iris_vae_qimage_t *vae);
  * not fit, 1 if it does or there is no GPU. */
 int iris_vae_reserve_qimage(iris_vae_qimage_t *vae, int h, int w);
 
-/* Free the decoder's GPU activations, leaving its weights loaded. */
+/* Free the GPU activations and the encoder, leaving the decoder's weights
+ * loaded. A later encode loads the encoder again. */
 void iris_vae_release_qimage(iris_vae_qimage_t *vae);
+
+/* Encode an image [in_channels, h, w] in [-1, 1] (h, w multiples of 16) into
+ * a normalized latent [z_dim, h / 16, w / 16] (caller frees). */
+float *iris_vae_encode_qimage(iris_vae_qimage_t *vae, const float *rgba, int h, int w);
 
 /* Decode a normalized latent [z_dim, h, w] (as the transformer produces
  * it) into an RGBA image of 16h x 16w pixels. */

@@ -10,6 +10,7 @@
 
 #include "iris.h"
 #include "jpeg.h"
+#include "iris_qimage.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1053,13 +1054,14 @@ iris_image *iris_image_convert(const iris_image *img, int new_channels) {
             const uint8_t *src = img->data + (y * img->width + x) * img->channels;
             uint8_t *dst = converted->data + (y * img->width + x) * new_channels;
 
-            if (img->channels == 1 && new_channels >= 3) {
-                /* Grayscale to RGB(A) */
+            if (img->channels <= 2 && new_channels >= 3) {
+                /* Grayscale (+ alpha) to RGB(A) */
                 dst[0] = dst[1] = dst[2] = src[0];
-                if (new_channels == 4) dst[3] = 255;
-            } else if (img->channels >= 3 && new_channels == 1) {
-                /* RGB to grayscale */
+                if (new_channels == 4) dst[3] = img->channels == 2 ? src[1] : 255;
+            } else if (img->channels >= 3 && new_channels <= 2) {
+                /* RGB(A) to grayscale (+ alpha) */
                 dst[0] = (uint8_t)(0.299f * src[0] + 0.587f * src[1] + 0.114f * src[2]);
+                if (new_channels == 2) dst[1] = img->channels == 4 ? src[3] : 255;
             } else {
                 /* Copy available channels */
                 for (int c = 0; c < new_channels; c++) {
@@ -1074,6 +1076,83 @@ iris_image *iris_image_convert(const iris_image *img, int new_channels) {
     }
 
     return converted;
+}
+
+/* ========================================================================
+ * Qwen-Image reference preparation
+ * ======================================================================== */
+
+/* calculate_dimensions: the aspect of width x height at about area pixels,
+ * on a 32-pixel grid. rint is Python's round (half to even). */
+void iris_ref_size_qimage(int width, int height, int area, int *ref_w, int *ref_h) {
+    double ratio = (double)width / height;
+    double w = sqrt(area * ratio), h = w / ratio;
+    *ref_w = (int)rint(w / 32) * 32;
+    *ref_h = (int)rint(h / 32) * 32;
+}
+
+/* a * b / 255, rounded the way PIL does it. */
+static uint8_t muldiv255(int a, int b) {
+    int t = a * b + 128;
+    return (uint8_t)(((t >> 8) + t) >> 8);
+}
+
+/* An RGBA copy of img at its reference size. Like PIL, an image with
+ * transparency is resized premultiplied, so colour under alpha 0 is lost. */
+iris_image *iris_ref_prepare_qimage(const iris_image *img, int area) {
+    int w, h;
+    iris_ref_size_qimage(img->width, img->height, area, &w, &h);
+    if (w == 0 || h == 0 || (w > h ? w > 200 * h : h > 200 * w)) {
+        fprintf(stderr, "Qwen-Image: unsupported reference aspect %dx%d\n",
+                img->width, img->height);
+        return NULL;
+    }
+    iris_image *rgba = iris_image_convert(img, 4);
+    if (!rgba || (w == rgba->width && h == rgba->height)) return rgba;
+
+    size_t npix = (size_t)rgba->width * rgba->height;
+    int alpha = 0;
+    for (size_t p = 0; p < npix && !alpha; p++) alpha = rgba->data[p * 4 + 3] != 255;
+    for (size_t p = 0; alpha && p < npix; p++) {
+        uint8_t *px = rgba->data + p * 4;
+        for (int c = 0; c < 3; c++) px[c] = muldiv255(px[c], px[3]);
+    }
+    iris_image *resized = iris_image_resize(rgba, w, h);
+    iris_image_free(rgba);
+    for (size_t p = 0; alpha && resized && p < (size_t)w * h; p++) {
+        uint8_t *px = resized->data + p * 4;
+        if (px[3] == 0 || px[3] == 255) continue;
+        for (int c = 0; c < 3; c++) {
+            int v = 255 * px[c] / px[3];
+            px[c] = (uint8_t)(v > 255 ? 255 : v);
+        }
+    }
+    return resized;
+}
+
+/* The vision encoder's RGB copy of a prepared reference: over white. */
+iris_image *iris_ref_vision_qimage(const iris_image *rgba) {
+    iris_image *rgb = iris_image_create(rgba->width, rgba->height, 3);
+    if (!rgb) return NULL;
+    for (size_t p = 0; p < (size_t)rgba->width * rgba->height; p++) {
+        const uint8_t *px = rgba->data + p * 4;
+        for (int c = 0; c < 3; c++) {
+            int t = px[c] * px[3] + 255 * (255 - px[3]) + 128;   /* PIL's blend */
+            rgb->data[p * 3 + c] = (uint8_t)(((t >> 8) + t) >> 8);
+        }
+    }
+    return rgb;
+}
+
+/* The VAE input of a prepared reference: [4, h, w] in [-1, 1] (caller frees). */
+float *iris_ref_pixels_qimage(const iris_image *rgba) {
+    size_t npix = (size_t)rgba->width * rgba->height;
+    float *x = malloc(npix * 4 * sizeof(float));
+    if (!x) return NULL;
+    for (int c = 0; c < 4; c++)
+        for (size_t p = 0; p < npix; p++)
+            x[c * npix + p] = 2.0f * (rgba->data[p * 4 + c] / 255.0f) - 1.0f;
+    return x;
 }
 
 /* strcasecmp for portability */
