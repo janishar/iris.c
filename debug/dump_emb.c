@@ -5,8 +5,8 @@
  * Build (after make blas / make mps, from the repository root):
  *   make lib
  *   cc -O2 -I. -o /tmp/dump_emb debug/dump_emb.c libiris.a -lm -lopenblas
- * (Accelerate builds link with -framework Accelerate; MPS builds also need
- * the Metal objects and frameworks, so use a BLAS build.)
+ * (Accelerate builds link with -framework Accelerate. For MPS, build with
+ * -DUSE_METAL -DIRIS_DEV and link as in debug/dump_qimage.c.)
  *
  * Usage: /tmp/dump_emb MODEL_DIR PROMPT OUT.bin
  * Writes [seq, text_dim] raw float32 and prints seq and text_dim.
@@ -15,12 +15,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "iris.h"
+#ifdef USE_METAL
+#include "iris_metal.h"
+#endif
+#ifdef IRIS_DEV
+#include "iris_dev.h"
+#endif
 
 int main(int argc, char **argv) {
     if (argc != 4) {
         fprintf(stderr, "usage: %s MODEL_DIR PROMPT OUT.bin\n", argv[0]);
         return 1;
     }
+#ifdef USE_METAL
+    iris_metal_init();
+#endif
+#ifdef IRIS_DEV
+    iris_dev_init();
+#endif
     iris_ctx *ctx = iris_load_dir(argv[1]);
     if (!ctx) {
         fprintf(stderr, "failed to load %s: %s\n", argv[1], iris_get_error());

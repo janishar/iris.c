@@ -731,9 +731,9 @@ void iris_dev_linear_bf16(uint16_t *y, const uint16_t *x, const uint16_t *W, int
 }
 
 static IrisDevGraph *sdpa_graph(int seq_q, int seq_k, int heads, int head_dim, float scale,
-                                int masked) {
-    NSString *key = [NSString stringWithFormat:@"sdpa %d %d %d %d %a %d", seq_q, seq_k, heads,
-                                               head_dim, scale, masked];
+                                int masked, int causal) {
+    NSString *key = [NSString stringWithFormat:@"sdpa %d %d %d %d %a %d %d", seq_q, seq_k, heads,
+                                               head_dim, scale, masked, causal];
     IrisDevGraph *g = g_graphs[key];
     if (g) return g;
     g = [IrisDevGraph new];
@@ -745,21 +745,35 @@ static IrisDevGraph *sdpa_graph(int seq_q, int seq_k, int heads, int head_dim, f
     MPSGraphTensor *qt = [g.graph transposeTensor:q dimension:1 withDimension:2 name:nil];
     MPSGraphTensor *kt = [g.graph transposeTensor:k dimension:1 withDimension:2 name:nil];
     MPSGraphTensor *vt = [g.graph transposeTensor:v dimension:1 withDimension:2 name:nil];
-    MPSGraphTensor *o;
+    NSMutableArray *inputs = [NSMutableArray arrayWithObjects:q, k, v, nil];
+    NSMutableArray *shapes = [NSMutableArray arrayWithObjects:qs, ks, ks, nil];
+    MPSGraphTensor *mask = nil;
     if (masked) {
         NSArray *ms = @[@1, @1, @1, @(seq_k)];
-        MPSGraphTensor *m = [g.graph placeholderWithShape:ms dataType:MPSDataTypeBFloat16 name:nil];
+        mask = [g.graph placeholderWithShape:ms dataType:MPSDataTypeBFloat16 name:nil];
+        [inputs addObject:mask];
+        [shapes addObject:ms];
+    }
+    if (causal) {
+        /* Additive bias: -inf (bf16) where query i meets key j > i. */
+        NSMutableData *tri = [NSMutableData dataWithLength:(size_t)seq_q * seq_k * sizeof(uint16_t)];
+        uint16_t *b = tri.mutableBytes;
+        for (int i = 0; i < seq_q; i++)
+            for (int j = i + 1; j < seq_k; j++) b[(size_t)i * seq_k + j] = 0xFF80;
+        MPSGraphTensor *t = [g.graph constantWithData:tri shape:@[@1, @1, @(seq_q), @(seq_k)]
+                                             dataType:MPSDataTypeBFloat16];
+        mask = mask ? [g.graph additionWithPrimaryTensor:mask secondaryTensor:t name:nil] : t;
+    }
+    MPSGraphTensor *o;
+    if (mask)
         o = [g.graph scaledDotProductAttentionWithQueryTensor:qt keyTensor:kt valueTensor:vt
-                                                   maskTensor:m scale:scale name:nil];
-        g.inputs = @[q, k, v, m];
-        g.shapes = @[qs, ks, ks, ms];
-    } else {
+                                                   maskTensor:mask scale:scale name:nil];
+    else
         o = [g.graph scaledDotProductAttentionWithQueryTensor:qt keyTensor:kt valueTensor:vt
                                                         scale:scale name:nil];
-        g.inputs = @[q, k, v];
-        g.shapes = @[qs, ks, ks];
-    }
     o = [g.graph transposeTensor:o dimension:1 withDimension:2 name:nil];
+    g.inputs = inputs;
+    g.shapes = shapes;
     g.output = o;
     g.outShape = qs;
     g.outType = MPSDataTypeBFloat16;
@@ -768,14 +782,14 @@ static IrisDevGraph *sdpa_graph(int seq_q, int seq_k, int heads, int head_dim, f
 }
 
 /* Attention through MPSGraph's fused SDPA, on contiguous copies of q, k, v
- * when they are strided views; the key mask becomes an additive bias.
- * Supports the non-causal case with one kv head per query head. */
+ * when they are strided views; the key mask and the causal triangle become
+ * an additive bias. Supports one kv head per query head. */
 void iris_dev_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_t *k,
                         const uint16_t *v, int ldi, int seq_q, int seq_k, int heads,
                         int kv_heads, int head_dim, float scale, int causal,
                         const int *key_mask) {
-    if (causal || kv_heads != heads) {
-        fprintf(stderr, "iris_dev: Metal attention supports only non-causal MHA\n");
+    if (kv_heads != heads) {
+        fprintf(stderr, "iris_dev: Metal attention needs one kv head per query head\n");
         return;
     }
     @autoreleasepool {
@@ -813,7 +827,8 @@ void iris_dev_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_
             end_elementwise(e, seq_k);
             [ptrs addObject:[NSValue valueWithPointer:s]];
         }
-        IrisDevGraph *g = sdpa_graph(seq_q, seq_k, heads, head_dim, scale, key_mask != NULL);
+        IrisDevGraph *g = sdpa_graph(seq_q, seq_k, heads, head_dim, scale, key_mask != NULL,
+                                     causal);
         run_graph(g, ptrs, oc);
         if (out_strided) copy_2d(out, ldo, oc, dim, seq_q, dim);
     }
