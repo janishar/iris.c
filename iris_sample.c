@@ -310,7 +310,8 @@ float *iris_schedule_qimage(const iris_qimage_sched_t *s, const float *sigmas,
         }
         schedule[i] = (float)t;
     }
-    if (s->shift_terminal > 0) {
+    /* A lone sigma of 1 has nothing to stretch (upstream divides by zero). */
+    if (s->shift_terminal > 0 && schedule[num_steps - 1] < 1.0f) {
         double scale = (1.0 - schedule[num_steps - 1]) / (1.0 - s->shift_terminal);
         for (int i = 0; i < num_steps; i++)
             schedule[i] = (float)(1.0 - (1.0 - schedule[i]) / scale);

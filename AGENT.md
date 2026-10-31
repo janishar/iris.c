@@ -510,14 +510,18 @@ theta 10000 (hardcoded upstream), eps 1e-6, causal_condition=true. No biases.
 
 # Qwen-Image Known Pitfalls
 
-1. **Turbo sigmas are shifted too**: the pipeline passes sample_sigmas through
-   the scheduler's dynamic shift and terminal stretch; do not special-case
-   Turbo, read the scheduler config.
+1. **Turbo sigmas go through the scheduler too**: the pipeline passes
+   sample_sigmas through the same set_timesteps as the base schedule. Turbo's
+   config turns dynamic shift and terminal stretch off, so they come out
+   unchanged; do not special-case Turbo, read the scheduler config.
 2. **DupUp shortcut**: `out[o, 2y+i, 2x+j] = in[(((o*ft + ft-1)*2+i)*2+j) /
    repeats, y, x]` (first_chunk keeps temporal slot ft-1). It is not a plain
    nearest upsample for the channel-reducing blocks.
 3. **Device path rounding**: bf16 activations give about 1% relative error vs
    the float32 reference, the same as running upstream in bf16.
+4. **Causal device attention**: the prefill is the only causal caller of
+   iris_dev_attention in MPS builds. Metal used to return without writing, so
+   text keys lost their attention output and velocities were 11-32% off.
 
 # Device Backend (CUDA / ROCm / Metal)
 
@@ -540,7 +544,8 @@ theta 10000 (hardcoded upstream), eps 1e-6, causal_condition=true. No biases.
   MTLBuffers, mapped back to (buffer, offset) by a sorted allocation table.
   Work goes into one command buffer, committed by sync/download/upload/free.
   GEMMs and attention use MPSGraph (bf16 matmul, fused SDPA on contiguous
-  copies of q/k/v). In MPS builds only the transformers use it: the Qwen3
+  copies of q/k/v, key mask and causal triangle as an additive bias). In MPS
+  builds only the transformers use it: the Qwen3
   and VAE device paths are compiled out (QWEN3_DEV / VAE_DEV).
 
 Known pitfalls:

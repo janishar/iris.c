@@ -110,26 +110,33 @@ FLUX3_TESTS = [
 ]
 
 
-# Optional Qwen-Image 2.1 smoke test (base or Turbo; 8 steps is Turbo's
-# fixed grid). A reference image from debug/qimage_reference.py, started
-# from the noise iris generates for the seed, can replace the size check.
-QIMAGE_SMOKE_TEST = {
-    "name": "Qwen-Image 2.1 smoke test (8 steps, 256x256)",
-    "prompt": "A fluffy orange cat sitting on a windowsill",
-    "seed": 42,
-    "steps": 8,
-    "width": 256,
-    "height": 256,
-}
+# Optional Qwen-Image 2.1 test, run only if a Turbo model directory is found
+# (the base model's schedule gives another image). The reference was produced
+# by debug/qimage_reference.py (official diffusers components, float32)
+# starting from the noise iris generates for seed 42. Correct output measures
+# a mean_diff of 0.6, a broken text prefix about 24.
+QIMAGE_TESTS = [
+    {
+        "name": "Qwen-Image 2.1 Turbo test (8 steps, 256x256)",
+        "prompt": "A fluffy orange cat sitting on a windowsill",
+        "seed": 42,
+        "steps": 8,
+        "width": 256,
+        "height": 256,
+        "reference": "test_vectors/reference_qimage_turbo_8step_256x256_seed42.png",
+        "mean_diff_threshold": 5,
+    },
+]
 
 
-def is_qimage_model_dir(model_dir: Path) -> bool:
-    """Return True if model_dir looks like a Qwen-Image 2.1 model directory."""
+def is_qimage_turbo_model_dir(model_dir: Path) -> bool:
+    """Return True if model_dir looks like a Qwen-Image 2.1 Turbo model directory."""
     model_index = model_dir / "model_index.json"
     try:
-        return "QwenImage21Pipeline" in model_index.read_text(encoding="utf-8", errors="ignore")
+        text = model_index.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return False
+    return "QwenImage21Pipeline" in text and "sample_sigmas" in text
 
 
 def is_flux3_model_dir(model_dir: Path) -> bool:
@@ -258,7 +265,7 @@ def main():
     parser.add_argument("--flux3-model-dir", default=None,
                         help="Optional FLUX.3 model dir (auto-detected if omitted)")
     parser.add_argument("--qimage-model-dir", default=None,
-                        help="Optional Qwen-Image 2.1 model dir (auto-detected if omitted)")
+                        help="Optional Qwen-Image 2.1 Turbo model dir (auto-detected if omitted)")
     parser.add_argument("--quick", action="store_true", help="Run only the quick 64x64 test")
     parser.add_argument("--full", action="store_true",
                         help="Also run slow tests that require visual inspection")
@@ -277,8 +284,8 @@ def main():
          ("zimage-turbo", "zimage", "Z-Image-Turbo"), is_zimage_model_dir),
         ("FLUX.3", "--flux3-model-dir", args.flux3_model_dir, FLUX3_TESTS,
          ("flux-3-klein", "flux-3-klein-base"), is_flux3_model_dir),
-        ("Qwen-Image", "--qimage-model-dir", args.qimage_model_dir, [QIMAGE_SMOKE_TEST],
-         ("qwen-image-2.1-turbo", "qwen-image-2.1"), is_qimage_model_dir),
+        ("Qwen-Image", "--qimage-model-dir", args.qimage_model_dir, QIMAGE_TESTS,
+         ("qwen-image-2.1-turbo",), is_qimage_turbo_model_dir),
     ]
     for label, flag, explicit, tests, names, matches in optional:
         if args.quick:

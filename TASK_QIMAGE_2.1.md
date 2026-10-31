@@ -1,9 +1,8 @@
 # Task: add Qwen-Image 2.1 and Turbo support
 
-Status: implemented (M0 to M6, transformer device path included), verified
-against the official diffusers classes on tiny random-weight checkpoints.
-Not yet run on the real weights: that is the remaining work, listed in
-"Remaining work" below. Delete this file when the work is merged.
+Status: implemented and verified on the real weights on MPS and BLAS (see
+"Measured on the real weights"). Not built: CUDA and ROCm (no toolchain on
+the Mac). Delete this file when the work is merged.
 
 ## Implementation status
 
@@ -19,48 +18,52 @@ What exists:
 | M5 VAE decoder | `iris_vae_qimage.c` (CPU, BLAS) |
 | M6 plumbing | iris.c routing, iris_cli.c, main.c help, Makefile, download scripts, run_test.py smoke test, README, CLAUDE.md |
 
-Verified in a Linux session without the real weights. Tiny checkpoints were
-built with the upstream classes (2 blocks, head_dim 32; VAE with the real
-`dim_mult` pattern at base width 8; all weights random, norms included).
-Results:
+## Measured on the real weights
 
-| Check | Result |
-|---|---|
-| Scheduler (dynamic shift + terminal stretch) | max abs diff 1.2e-7 |
-| Transformer velocities, steps 0 and 1, BLAS and generic | relative L2 4.5e-6 / 1.2e-6 |
-| Prefix reuse across forward calls | included in the step 1 check |
-| Transformer device path (CPU emulation of iris_dev.h) | relative L2 0.8% (upstream itself in bf16: 1.2%) |
-| VAE decode of the reference latent | max 1/255, one pixel |
-| `./iris -e emb.bin --noise noise.bin` vs reference PNG, base 3 steps, Turbo 8 steps, 160x96 | max 1/255, mean < 0.001 |
-| Weight names and shapes | match the upstream safetensors |
-| `download_model.sh qimage-turbo` file selection | checked with a stub curl |
+M5 Pro, 64 GB, against `debug/qimage_reference.py` (diffusers float32, CPU) from
+the noise iris generates for seed 42, prompt "A fluffy orange cat sitting on a
+windowsill". `debug/dump_qimage.c` runs each step on the reference latent, so
+velocity errors do not accumulate; "free run" uses C velocities only.
 
-Not verified here: the text encoder (no Qwen3-VL tokenizer or weights;
-`tokens.txt` and `drop_idx.txt` decide it), the real configs, CUDA and Metal
-compilation of `iris_dev_copy_2d` (no toolchains), and performance.
+| Check | BLAS | MPS |
+|---|---|---|
+| Text embeddings, relative L2, 6 prompts of 9 to 555 rows (empty, Chinese, punctuation) | 4.1e-6 to 6.0e-5 | 4.1e-6 to 2.1e-5 |
+| Same, max abs (values around 8.7 in mean magnitude) | 0.095 | 0.072 |
+| Embedding row count | exact | exact |
+| Velocity relative L2, Turbo 256x256, 8 steps | 1.7e-6 to 3.1e-6 | 3.4e-3 to 1.2e-2 |
+| Velocity relative L2, Turbo 384x256, 8 steps | 2.0e-6 to 7.4e-6 | 3.1e-3 to 8.9e-3 |
+| Velocity relative L2, base 256x256, 40 steps | 1.3e-6 to 4.5e-6 | 2.4e-3 to 1.3e-2 |
+| Velocity max abs, all runs | 1.4e-4 | 0.20 |
+| Free-run latent relative L2, all runs | 7.8e-6 to 1.6e-5 | 2.0e-2 to 3.3e-2 |
+| VAE decode of the reference latent, max per channel | 1/255 | 1/255 |
+| `./iris -e --noise` vs reference PNG, mean / max (of 255), Turbo | 0.0003 / 1 | 1.28 / 140 |
+| Same, base | 0.0007 / 1 | 0.70 / 114 |
+
+Upstream diffusers in bf16 against its own float32 run has velocity relative L2
+6.3e-3 to 1.6e-2 on the same Turbo inputs, so the MPS error is bf16 rounding.
+
+Scheduler: base within 1.24e-7 of diffusers for 4, 20, 40 and 50 steps at
+256x256, 1024x1024, 2048x2048 and 2752x1536. Turbo's config has shift and
+stretch off, so its grid is unchanged. `--steps 1` on base divides by zero in
+upstream's stretch, and iris skips the stretch there.
+
+Full runs, MPS, 1024x1024: Turbo 52 s, base 139 s, about 2.5 s per step, peak
+memory footprint 26 GB. VAE decode runs on the CPU and takes 22.8 s.
+
+FLUX.3: output byte-identical to `main` (41fc94e) on MPS; BLAS within 1/255 of
+the reference vectors. REPL: the first generation of a prompt is byte-identical
+to the CLI. A repeated prompt uses the 4-bit embedding cache, as on the other
+distilled models, and differs by a mean of 1.66/255.
+
+Not verified: CUDA and ROCm builds, generic at runtime (it builds), 2K sizes.
+`make test` needs numpy in `python3`, and its three Flux.2 tests need
+`flux-klein-4b`, which is not on this machine.
 
 ## Remaining work
 
-On the Mac, in this order:
-
-1. `make mps` and `make blas`; `make test` (FLUX.3 must match its baseline).
-2. Noise for seed 42 at 256x256:
-   `make lib && cc -O2 -I. -o /tmp/dump_noise debug/dump_noise.c libiris.a -lm -framework Accelerate`,
-   then `/tmp/dump_noise 64 16 16 42 /tmp/noise.bin`.
-3. Reference on Turbo: `python debug/qimage_reference.py -d ~/GenAI/models/Qwen-Image-2.1-Turbo
-   -p "A fluffy orange cat sitting on a windowsill" -W 256 -H 256 --noise /tmp/noise.bin
-   --blocks -o /tmp/qref`. Check that the printed scheduler config is as expected.
-4. Text encoder: `/tmp/dump_emb MODEL "A fluffy orange cat sitting on a windowsill"
-   /tmp/emb_c.bin` (build line in `debug/dump_emb.c`, BLAS build) and compare
-   with `/tmp/qref/emb.bin`; its row count must be `len(tokens.txt) - drop_idx`.
-   If it differs, compare the token ids first.
-5. Transformer and VAE without the encoder:
-   `./iris -d MODEL -e /tmp/qref/emb.bin --noise /tmp/noise.bin -W 256 -H 256 -o /tmp/q.png`,
-   compared with `/tmp/qref/image.png`, on the BLAS and the MPS build.
-6. Full prompt runs at 1024x1024 for Turbo and base; then add a reference
-   test vector to `run_test.py` (replacing the smoke test's size check).
-7. Optional: a device path for the VAE decoder (needed for speed on CUDA
-   builds without OpenBLAS; new kernels: per-pixel RMS norm, DupUp).
+Optional: a device path for the VAE decoder (new kernels: per-pixel RMS norm,
+DupUp). It would cut the 22.8 s decode at 1024x1024, and it is needed for speed
+on CUDA builds without OpenBLAS.
 
 ## Goal
 

@@ -27,6 +27,15 @@ Generated with:
 ./flux -d flux-klein-4b -p "A fluffy orange cat sitting on a windowsill" --seed 42 --steps 1 -o test_vectors/reference_1step_64x64_seed42.png -W 64 -H 64
 ```
 
+## reference_qimage_turbo_8step_256x256_seed42.png
+
+Qwen-Image 2.1 Turbo from the official diffusers components in float32,
+starting from the noise iris generates for seed 42 (`debug/dump_noise.c`):
+```bash
+python debug/qimage_reference.py -d qwen-image-2.1-turbo -W 256 -H 256 \
+    -p "A fluffy orange cat sitting on a windowsill" --noise noise.bin -o ref
+```
+
 ## Verification
 
 Run `make test` from the project root, or manually:

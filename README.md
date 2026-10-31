@@ -351,7 +351,7 @@ The tests compare generated images against reference images in `test_vectors/`. 
 | img2img | 256x256 | 4 | Validates image-to-image transformation |
 | Z-Image | 256x256 | 2 | Z-Image smoke test (auto-detected) |
 | FLUX.3 | 256x256 | 4 | FLUX.3 Klein against the official pipeline (auto-detected) |
-| Qwen-Image | 256x256 | 8 | Qwen-Image 2.1 smoke test (auto-detected) |
+| Qwen-Image | 256x256 | 8 | Qwen-Image 2.1 Turbo against the official components (auto-detected) |
 
 You can also run the test script directly for more options:
 ```bash
