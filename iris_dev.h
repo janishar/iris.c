@@ -84,6 +84,12 @@ void iris_dev_head_norm_rope(uint16_t *x, int ld, const float *w,
                              int seq, int heads, int head_dim, float eps,
                              int split_half);
 
+/* In place, no norm: rotate the pairs (i, i + head_dim / 2) of the heads
+ * x[s, h * head_dim + d] (row stride ld) by the angles of row s
+ * (cos/sin: [seq, head_dim / 2]). */
+void iris_dev_rope(uint16_t *x, int ld, const float *cos, const float *sin,
+                   int seq, int heads, int head_dim);
+
 /* Scaled dot-product attention over bf16 [seq, heads * head_dim] tensors.
  * q, k, v share the row stride ldi, out has row stride ldo. With fewer kv
  * heads (GQA), query head h uses kv head h / (heads / kv_heads).
@@ -106,6 +112,7 @@ void iris_dev_residual(float *x, const float *a, const float *gate,
 
 /* Elementwise helpers on f32 vectors. */
 void iris_dev_silu(float *x, size_t n);
+void iris_dev_gelu_tanh(float *x, size_t n);
 void iris_dev_add(float *x, const float *a, size_t n);   /* x += a */
 void iris_dev_add_bias(float *y, const float *bias, int rows, int cols);  /* y[r, c] += bias[c] */
 void iris_dev_fill_rows(float *out, const float *row, int rows, int dim); /* out[r, c] = row[c] */

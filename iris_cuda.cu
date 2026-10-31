@@ -294,6 +294,13 @@ __global__ void k_silu(float *x, size_t n) {
     if (i < n) x[i] = x[i] / (1.0f + expf(-x[i]));
 }
 
+__global__ void k_gelu_tanh(float *x, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float u = x[i];
+    x[i] = 0.5f * u * (1.0f + tanhf(0.7978845608028654f * (u + 0.044715f * u * u * u)));
+}
+
 __global__ void k_add(float *x, const float *a, size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] += a[i];
@@ -326,6 +333,10 @@ extern "C" void iris_dev_f32_to_bf16(uint16_t *dst, const float *src, size_t n) 
 
 extern "C" void iris_dev_silu(float *x, size_t n) {
     if (n) k_silu<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(x, n);
+}
+
+extern "C" void iris_dev_gelu_tanh(float *x, size_t n) {
+    if (n) k_gelu_tanh<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(x, n);
 }
 
 extern "C" void iris_dev_add(float *x, const float *a, size_t n) {
@@ -426,6 +437,21 @@ __global__ void k_head_norm_rope(uint16_t *x, int ld, const float *w,
     v[i1] = f2bf(b * c + a * sn);
 }
 
+/* One thread per rotated pair of the (row, head) grid. */
+__global__ void k_rope(uint16_t *x, int ld, const float *rope_cos, const float *rope_sin,
+                       int heads, int head_dim, size_t n) {
+    size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n) return;
+    int half = head_dim / 2;
+    size_t s = e / (heads * half);
+    int rest = (int)(e % (heads * half)), i = rest % half;
+    uint16_t *v = x + s * ld + (size_t)(rest / half) * head_dim;
+    float a = bf2f(v[i]), b = bf2f(v[i + half]);
+    float c = rope_cos[s * half + i], sn = rope_sin[s * half + i];
+    v[i] = f2bf(a * c - b * sn);
+    v[i + half] = f2bf(b * c + a * sn);
+}
+
 extern "C" void iris_dev_layer_norm_mod(uint16_t *out, const float *x,
                                         const float *shift, const float *scale,
                                         int rows, int dim, float eps) {
@@ -457,6 +483,13 @@ extern "C" void iris_dev_head_norm_rope(uint16_t *x, int ld, const float *w,
     int threads = head_dim / 2;   /* power of two for block_reduce */
     k_head_norm_rope<<<dim3(seq, heads), threads, threads * sizeof(float), g_stream>>>(
         x, ld, w, rope_cos, rope_sin, head_dim, eps, split_half);
+}
+
+extern "C" void iris_dev_rope(uint16_t *x, int ld, const float *rope_cos, const float *rope_sin,
+                              int seq, int heads, int head_dim) {
+    size_t n = (size_t)seq * heads * (head_dim / 2);
+    if (n) k_rope<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(x, ld, rope_cos, rope_sin, heads,
+                                                             head_dim, n);
 }
 
 /* ========================================================================

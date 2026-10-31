@@ -9,6 +9,7 @@
 #define IRIS_QWEN3_H
 
 #include <stdint.h>
+#include "iris_safetensors.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -177,6 +178,39 @@ float *qwen3_encode_text(qwen3_encoder_t *enc, const char *prompt);
  */
 float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
                               int *out_num_tokens, int *out_seq_len);
+
+/*
+ * Open the safetensors shards of model_dir (index, or a single file).
+ * Returns the number of files opened, 0 on failure.
+ */
+int open_safetensors_shards(const char *model_dir,
+                            safetensors_file_t **files, int max_files);
+
+/* ========================================================================
+ * Vision Tower (Qwen3-VL, iris_qwen3_vision.c)
+ * ======================================================================== */
+
+#define QWEN3_VISION_DEEPSTACK 3
+
+typedef struct qwen3_vision qwen3_vision_t;
+
+/*
+ * Open the model.visual.* weights of a text_encoder/ directory (shards or a
+ * single file). The weights stay mmapped; GPU builds upload them on the
+ * first image.
+ */
+qwen3_vision_t *qwen3_vision_load(const char *text_encoder_dir);
+
+void qwen3_vision_free(qwen3_vision_t *vision);
+
+/*
+ * Encode one image. rgb: [3, h, w], values 0..255; h and w multiples of 32.
+ * *embeds receives the main embeddings and deep[k] the deepstack features,
+ * each [tokens, 4096] in raster order of the merged blocks (caller frees).
+ * Returns tokens = (h / 32) * (w / 32), or 0 on failure.
+ */
+int qwen3_vision_encode(qwen3_vision_t *vision, const float *rgb, int h, int w,
+                        float **embeds, float *deep[QWEN3_VISION_DEEPSTACK]);
 
 #ifdef __cplusplus
 }
