@@ -1,6 +1,6 @@
 # Iris - a C inference pipeline for image synthesis models
 
-Iris is an inference pipeline that generates images from text prompts using open weights diffusion transformer models. It is implemented entirely in C, with zero external dependencies beyond the C standard library. MPS and BLAS acceleration are optional but recommended. Under macOS, a BLAS API is part of the system, so nothing is required.
+Iris is an inference pipeline that generates images from text prompts using open weights diffusion transformer models. It is implemented entirely in C, with zero external dependencies beyond the C standard library. MPS, CUDA, ROCm and BLAS acceleration are optional but recommended. Under macOS, a BLAS API is part of the system, so nothing is required.
 
 The name comes from the Greek goddess Iris, messenger of the gods and personification of the rainbow.
 
@@ -13,12 +13,20 @@ Supported model families:
   - **9B base** (50 steps, CFG, highest quality. Non-commercial license).
 - **[Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)** (by Tongyi-MAI):
   - **6B** (8 NFE / 9 scheduler steps, no CFG, fast).
+- **[FLUX.3 Image Klein](https://huggingface.co/black-forest-labs/flux-3-image-klein)** (by [Black Forest Labs](https://bfl.ai/)):
+  - **5.6B distilled** (16 steps by default, trained for 4 to 16, no CFG. FLUX Kommunity License).
+  - **5.6B base** (50 steps, CFG. FLUX Kommunity License). Implemented but not tested yet: the weights were not accessible at the time of writing.
+  - Text-to-image, editing (`-i image`) and multi-reference generation (`-i` repeated).
+
+All the models run fully on the GPU with the Metal (Apple), CUDA (NVIDIA) and ROCm (AMD) backends.
 
 ## Quick Start
 
 ```bash
 # Build (choose your backend)
 make mps       # Apple Silicon (fastest)
+# or: make cuda    # NVIDIA GPU
+# or: make rocm    # AMD GPU
 # or: make blas    # Intel Mac / Linux with OpenBLAS
 # or: make generic # Pure C, no dependencies
 
@@ -55,7 +63,14 @@ pip install huggingface_hub && python download_model.py zimage-turbo
 ./iris -d zimage-turbo -p "a fish" -o fish.png
 ```
 
-That's it. No Python runtime or CUDA toolkit required at inference time.
+For FLUX.3 Image Klein (gated, accept the license on HuggingFace first, ~20GB):
+```bash
+./download_model.sh flux3 --token YOUR_TOKEN
+# or: python download_model.py flux3 --token YOUR_TOKEN
+./iris -d flux-3-klein -p "a fish" -o fish.png
+```
+
+That's it. No Python runtime required at inference time.
 
 ## Example Output
 
@@ -72,12 +87,12 @@ That's it. No Python runtime or CUDA toolkit required at inference time.
 ## Features
 
 - **Zero dependencies**: Pure C implementation, works standalone. BLAS optional for ~30x speedup (Apple Accelerate on macOS, OpenBLAS on Linux)
-- **Metal GPU acceleration**: Automatic on Apple Silicon Macs. Performance matches PyTorch's optimized MPS pipeline
+- **GPU acceleration**: Metal on Apple Silicon Macs (automatic), CUDA on NVIDIA and ROCm on AMD GPUs. On Apple Silicon it is faster than PyTorch's optimized MPS pipeline
 - **Runs where Python can't**: Memory-mapped weights (default) enable inference on 8GB RAM systems where the Python ML stack cannot run at all
 - **Text-to-image**: Generate images from text prompts
 - **Image-to-image**: Transform existing images guided by prompts (Flux models)
 - **Multi-reference**: Combine multiple reference images (e.g., `-i car.png -i beach.png` for "car on beach")
-- **Integrated text encoder**: Qwen3 encoder built-in (4B or 8B depending on model), no external embedding computation needed
+- **Integrated text encoder**: Qwen3 encoder built-in (4B or 8B depending on model, Qwen3-VL 4B for FLUX.3), no external embedding computation needed
 - **Memory efficient**: Automatic encoder release after encoding (up to ~16GB freed)
 - **Memory-mapped weights**: Enabled by default. Reduces peak memory from ~16GB to ~4-5GB. Fastest mode on MPS; BLAS users with plenty of RAM may prefer `--no-mmap` for faster inference
 - **Size-independent seeds**: Same seed produces similar compositions at different resolutions. Explore at 256x256, then render at 512x512 with the same seed
@@ -274,13 +289,23 @@ make            # Show available backends
 make generic    # Pure C, no dependencies (slow)
 make blas       # BLAS acceleration (~30x faster)
 make mps        # Apple Silicon Metal GPU (fastest, macOS only)
+make cuda       # NVIDIA GPU (needs the CUDA toolkit, with cuBLAS)
+make rocm       # AMD GPU (needs ROCm, with hipBLAS)
 ```
 
 **Recommended:**
 - macOS Apple Silicon: `make mps`
 - macOS Intel: `make blas`
+- Linux with an NVIDIA / AMD GPU: `make cuda` / `make rocm`
 - Linux with OpenBLAS: `make blas`
 - Linux without OpenBLAS: `make generic`
+
+The CUDA and ROCm backends run the whole pipeline of every model on the
+GPU (text encoder, transformer, VAE), in bf16 with f32 accumulation. Add
+`OPENBLAS=1` to use OpenBLAS for the CPU fallback (used when the GPU runs
+out of memory). The build targets the GPU of the machine it runs on; set
+`GPU_ARCH` (e.g. `GPU_ARCH=sm_121` or `GPU_ARCH=gfx1151`) to build for
+another one, and `CUDA_HOME` / `ROCM_HOME` for non-standard install paths.
 
 For `make blas` on Linux, install OpenBLAS first:
 ```bash
@@ -315,6 +340,7 @@ The tests compare generated images against reference images in `test_vectors/`. 
 | Full | 512x512 | 4 | Validates txt2img at larger resolution |
 | img2img | 256x256 | 4 | Validates image-to-image transformation |
 | Z-Image | 256x256 | 2 | Z-Image smoke test (auto-detected) |
+| FLUX.3 | 256x256 | 4 | FLUX.3 Klein against the official pipeline (auto-detected) |
 
 You can also run the test script directly for more options:
 ```bash
@@ -355,6 +381,14 @@ Download model weights from HuggingFace using one of these methods:
 pip install huggingface_hub && python download_model.py zimage-turbo
 ```
 
+**FLUX.3 Image Klein** (~20GB, FLUX Kommunity License):
+```bash
+# Gated: accept the license at https://huggingface.co/black-forest-labs/flux-3-image-klein
+./download_model.sh flux3 --token YOUR_TOKEN        # distilled
+./download_model.sh flux3-base --token YOUR_TOKEN   # base (CFG)
+# or: python download_model.py flux3 --token YOUR_TOKEN
+```
+
 | Model | Directory | Size | Components |
 |-------|-----------|------|------------|
 | 4B distilled | `./flux-klein-4b` | ~16GB | VAE (~300MB), Transformer (~4GB), Qwen3-4B (~8GB) |
@@ -362,6 +396,8 @@ pip install huggingface_hub && python download_model.py zimage-turbo
 | 9B distilled | `./flux-klein-9b` | ~30GB | VAE (~300MB), Transformer (~17GB), Qwen3-8B (~15GB) |
 | 9B base | `./flux-klein-9b-base` | ~30GB | VAE (~300MB), Transformer (~17GB), Qwen3-8B (~15GB) |
 | Z-Image-Turbo | `./zimage-turbo` | ~12GB | VAE, Transformer (~6B), Qwen3-4B |
+| FLUX.3 distilled | `./flux-3-klein` | ~20GB | VAE (~300MB), Transformer (~11GB), Qwen3-VL-4B (~9GB) |
+| FLUX.3 base | `./flux-3-klein-base` | ~20GB | VAE (~300MB), Transformer (~11GB), Qwen3-VL-4B (~9GB) |
 
 ## How Fast Is It?
 
@@ -381,6 +417,24 @@ The MPS implementation is faster than the PyTorch optimized pipeline at all reso
 - The C BLAS backend (CPU) is not shown.
 - The `make generic` backend (pure C, no BLAS) is approximately 30x slower than BLAS and not included in benchmarks.
 - The fastest implementation for Metal remains [the Draw Things app](https://drawthings.ai/) that can produce a 1024x1024 image in just 14.23 seconds (in the same hardware), however it is worth noting that it uses 6-bit quantized weights, while this implementation uses the official BF16 weights. The 6-bit quantization used by Draw Things provides both a big memory win and a moderate speed advantage (not nearly as much as it could in an LLM, where causal attention is dominated by memory bandwidth); if we account for this, the performance is comparable.
+
+### Timings on recent GPUs
+
+FLUX.3 Image Klein distilled, default 16 steps, wall clock including model
+loading:
+
+| Size | Apple M5 Max (MPS) | NVIDIA GB10 (CUDA) | AMD Strix Halo, Radeon 8060S (ROCm) |
+|------|--------------------|--------------------|--------------------------------------|
+| 256x256 | 3.4s | 4.8s | 5.8s |
+| 512x512 | 5.3s | 6.2s | 9.7s |
+| 1024x1024 | 16.2s | 14.0s | 31.9s |
+
+FLUX.2 Klein 4B distilled, 4 steps, 1024x1024, wall clock including model
+loading: Apple M5 Max 6.2s, NVIDIA GB10 6.1s, AMD Strix Halo 9.1s.
+Z-Image-Turbo, 8 NFE, 1024x1024: Apple M5 Max 16.1s, NVIDIA GB10 13.0s, AMD Strix Halo
+23.3s.
+
+Most of the time at small sizes is model loading (uploading the weights).
 
 ### Community Benchmarks
 
@@ -448,6 +502,23 @@ Z-Image-Turbo uses an S3-DiT single-stream architecture with noise and context r
 | Text Encoder | Qwen3-4B (hidden_states[-2]) |
 | VAE | 16 latent channels, patch_size=2 |
 
+### FLUX.3 Image Klein
+
+FLUX.3 processes three token modes (text, image, reference images): each first goes through its own blocks, attending only within the mode, then all of them are joined for the shared blocks:
+
+| Component | FLUX.3 Image Klein |
+|-----------|--------------------|
+| Transformer hidden | 3072 |
+| Attention heads | 24 (head dim 128) |
+| Per-mode blocks | 5 per mode (separate weights for text, image, references) |
+| Joint blocks | 28 over `[TEXT, IMAGE, REFS]` |
+| Block | parallel attention + SwiGLU FFN, one gated residual |
+| RoPE | 4 axes (t, h, w, l) x 32 dims, theta 10000, image positions scaled by 0.5 |
+| Text Encoder | Qwen3-VL-4B text model, hidden_states[4, 8, ..., 32] concatenated (20480 dims) |
+| VAE | Same as FLUX.2 |
+
+Image tokens are modulated by the timestep, text and reference tokens by timestep 0. The distilled checkpoint is a flow map: every step is also told the timestep it jumps to. The prompt is padded to a multiple of 80 tokens and the transformer attends to the padding too, so the padding is part of the model recipe.
+
 ## Timestep Schedules
 
 Each model family has its own default schedule. Alternative schedules (`--linear`, `--power`, `--sigmoid`, `--flowmatch`) are available for experimentation. Any schedule can be used with any model.
@@ -488,6 +559,15 @@ For quick tests, **4 steps with `--linear`** works well and is twice as fast as 
 
 # Quick test: 4 steps with linear schedule
 ./iris -d zimage-turbo -p "a fish" -o fish.png -s 4 --linear
+```
+
+### FLUX.3 Image Klein
+
+FLUX.3 uses FlowMatch Euler with a large static shift (6.93), which keeps the noise level high for most of the run. The distilled model defaults to 16 steps but was trained for 4 to 16, so fewer steps are a valid speed/quality trade-off:
+
+```bash
+./iris -d flux-3-klein -p "a fish" -o fish.png          # 16 steps
+./iris -d flux-3-klein -p "a fish" -o fish.png -s 4     # 4x faster
 ```
 
 ### Cross-model schedules
@@ -568,7 +648,7 @@ This reduces peak memory from ~16GB to ~4-5GB, making inference possible on 16GB
 
 **Performance varies by backend:**
 
-- **MPS (Apple Silicon):** mmap is the **fastest** mode. The model stores weights in bf16 format, and MPS uses them directly via zero-copy pointers into the memory-mapped region. No conversion overhead, and the kernel handles paging efficiently.
+- **MPS, CUDA, ROCm:** mmap is the **fastest** mode. The weights are stored in bf16 format and go from the memory-mapped files to GPU memory without conversion; the transformer weights are uploaded once, at load time.
 
 - **BLAS (CPU):** mmap is **slightly slower** but uses much less RAM. BLAS requires f32 weights, so each block must be converted from bf16->f32 on every step (25 blocks x 4 steps = 100 conversions). With `--no-mmap`, this conversion happens once at startup. **Recommendation:** If you have 32GB+ RAM and use BLAS, try `--no-mmap` for faster inference. If RAM is limited, mmap lets you run at all.
 

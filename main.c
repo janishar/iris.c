@@ -36,6 +36,10 @@
 #include "iris_metal.h"
 #endif
 
+#ifdef IRIS_DEV
+#include "iris_dev.h"
+#endif
+
 #ifdef USE_BLAS
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -225,8 +229,10 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Generation options:\n");
     fprintf(stderr, "  -W, --width N         Output width (default: %d)\n", DEFAULT_WIDTH);
     fprintf(stderr, "  -H, --height N        Output height (default: %d)\n", DEFAULT_HEIGHT);
-    fprintf(stderr, "  -s, --steps N         Sampling steps (default: auto, 4 distilled / 50 base / 9 zimage)\n");
-    fprintf(stderr, "  -g, --guidance N      CFG guidance scale (default: auto, 1.0 distilled / 4.0 base / 0.0 zimage)\n");
+    fprintf(stderr, "  -s, --steps N         Sampling steps (default: auto, 4 distilled / 50 base / 9 zimage /\n");
+    fprintf(stderr, "                        16 flux3 distilled / 50 flux3 base)\n");
+    fprintf(stderr, "  -g, --guidance N      CFG guidance scale (default: auto, 1.0 distilled / 4.0 base / 0.0 zimage /\n");
+    fprintf(stderr, "                        0.0 flux3 distilled / 3.5 flux3 base)\n");
     fprintf(stderr, "  -S, --seed N          Random seed (-1 for random)\n");
     fprintf(stderr, "      --linear          Use linear timestep schedule\n");
     fprintf(stderr, "      --power           Use power curve timestep schedule (default alpha: 2.0)\n");
@@ -264,6 +270,9 @@ static void print_usage(const char *prog) {
 int main(int argc, char *argv[]) {
 #ifdef USE_METAL
     iris_metal_init();
+#endif
+#ifdef IRIS_DEV
+    iris_dev_init();
 #endif
 
     /* Command line options */
@@ -382,6 +391,12 @@ int main(int argc, char *argv[]) {
 
     /* Backend banner (suppressed by --quiet) */
     if (output_level != OUTPUT_QUIET) {
+#ifdef IRIS_DEV
+        if (iris_dev_available())
+            fprintf(stderr, "GPU: %s\n", iris_dev_name());
+        else
+            fprintf(stderr, "GPU: none found, running on the CPU\n");
+#endif
 #ifdef USE_METAL
         if (iris_metal_available()) {
             long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
@@ -499,32 +514,20 @@ int main(int argc, char *argv[]) {
     }
 
     /* Resolve auto-parameters now that we know the model type */
-    if (!steps_set || params.num_steps <= 0) {
-        if (iris_is_zimage(ctx))
-            params.num_steps = 9;  /* Z-Image-Turbo: 9 scheduler steps (8 NFE) */
-        else
-            params.num_steps = iris_is_distilled(ctx) ? 4 : 50;
-    }
-    if (params.guidance <= 0) {
-        if (iris_is_zimage(ctx))
-            params.guidance = 0.0f;
-        else
-            params.guidance = iris_is_distilled(ctx) ? 1.0f : 4.0f;
-    }
+    if (!steps_set || params.num_steps <= 0)
+        params.num_steps = iris_default_steps(ctx);
+    if (params.guidance <= 0)
+        params.guidance = iris_default_guidance(ctx);
 
     double load_time = timer_end();
     LOG_NORMAL(" done (%.1fs)\n", load_time);
     LOG_NORMAL("Model: %s\n", iris_model_info(ctx));
 
-    /* Non-commercial license warning for 9B model */
-    if (iris_is_non_commercial(ctx) && !no_license_info
-        && output_level != OUTPUT_QUIET) {
-        fprintf(stderr,
-            "\nNOTE: This model is released under a NON COMMERCIAL LICENSE.\n"
-            "The output can only be used under the terms of the\n"
-            "FLUX non-commercial license:\n"
-            "https://huggingface.co/black-forest-labs/FLUX.2-klein-9B/blob/main/LICENSE.md\n"
-            "(use --no-license-info to suppress this message)\n\n");
+    /* License notice for models with usage restrictions (9B, FLUX.3) */
+    const char *license = iris_license_notice(ctx);
+    if (license && !no_license_info && output_level != OUTPUT_QUIET) {
+        fprintf(stderr, "\nNOTE: %s\n"
+                        "(use --no-license-info to suppress this message)\n\n", license);
     }
 
     /* Interactive mode: start REPL */
@@ -581,9 +584,8 @@ int main(int argc, char *argv[]) {
                         i + 1, inputs[i]->width, inputs[i]->height, inputs[i]->channels);
         }
 
-        /* Use first input image dimensions if not explicitly set */
-        if (!width_set) params.width = inputs[0]->width;
-        if (!height_set) params.height = inputs[0]->height;
+        /* Without an explicit size the library uses the first reference's */
+        if (!width_set || !height_set) params.width = params.height = 0;
 
         /* Generate with multi-reference */
         output = iris_multiref(ctx, prompt, (const iris_image **)inputs, num_inputs, &params);
@@ -730,6 +732,9 @@ int main(int argc, char *argv[]) {
 
 #ifdef USE_METAL
     iris_metal_cleanup();
+#endif
+#ifdef IRIS_DEV
+    iris_dev_cleanup();
 #endif
 
     return 0;
