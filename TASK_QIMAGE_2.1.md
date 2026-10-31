@@ -1,7 +1,7 @@
 # Task: add Qwen-Image 2.1 and Turbo support
 
-Status: not started. No C code has been written. Delete this file when the
-work is merged.
+Status: planned, not started. No C code has been written. Delete this file
+when the work is merged.
 
 ## Goal
 
@@ -10,12 +10,31 @@ Add text-to-image for `Qwen/Qwen-Image-2.1` (40 steps) and
 generic builds. Output must match the official diffusers pipeline within the
 tolerance the FLUX.3 tests use.
 
-Base and Turbo are one architecture: their transformer configs are identical.
-Turbo adds a fixed sigma grid and needs no separate model family.
+Base and Turbo are one architecture with identical transformer configs. Turbo
+adds a fixed `sample_sigmas` grid in `model_index.json`. It is not a separate
+model family.
 
-Out of scope for this task (see "Phase 2" at the end): reference images and
-editing. Also skip CFG (off by default upstream), the prompt-rewrite models
+Out of scope (see "Phase 2" at the end): reference images and editing. Also
+skip CFG (`true_cfg_scale` defaults to 1.0 upstream), the prompt-rewrite models
 (`Qwen-Image-2.1-PE-*`), flex attention and VAE tiling.
+
+## Verification status of this plan
+
+The architecture notes below were checked line by line against diffusers
+`main` (2026-10-31):
+
+- `src/diffusers/models/transformers/transformer_qwenimage21.py`
+- `src/diffusers/models/autoencoders/autoencoder_kl_qwenimage21.py`
+- `src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py`
+- `src/diffusers/schedulers/scheduling_flow_match_euler_discrete.py`
+
+The C-side references were checked against this repository at commit 41fc94e.
+
+The checkpoint configs (`model_index.json`, `scheduler/scheduler_config.json`,
+`transformer/config.json`, `vae/config.json`) could not be fetched. Hugging Face
+was not reachable from the planning machine. Values below that come from class
+defaults are marked **[config]**. Read them from the files at runtime and
+confirm them against the local checkpoints first.
 
 ## What is already in place
 
@@ -33,234 +52,442 @@ Check these before relying on them:
   single `text_encoder/model.safetensors` and a BF16 VAE. Support both.
 - FLUX.2 and Z-Image weights were not found locally, so `make test` cannot run
   those tests here. Say so in the final report rather than implying they
-  passed. `make mps` built cleanly on the starting commit (0b02b52). No test
-  baseline has been recorded yet, so record one first.
+  passed. Record a test baseline (`make test`, FLUX.3 only) before any change.
 - Machine: M5 Pro, 64 GB. A float32 reference run needs the text encoder freed
   before the transformer loads.
 
-Line numbers below were correct at commit 0b02b52.
+## Cost estimate (computed from the config defaults)
+
+- Transformer: 32 blocks of `4*dim^2` (attention) plus `3*dim*3*dim` (SwiGLU)
+  weights, which is about 7.0 B parameters, 14 GB in bf16. The text encoder
+  (Qwen3-VL 8B text model) is about 16 GB in bf16.
+- At 1024x1024 a step has 4096 target tokens: about 57 TFLOP of GEMMs plus
+  about 9 TFLOP of attention, so roughly 66 TFLOP per step and 0.5 PFLOP for
+  8-step Turbo. The text prefix is computed once per prompt, not per step.
+- At 2048x2048 there are 4x the tokens: 4x the GEMMs and about 16x the attention.
+- VAE decode at 1024x1024 peaks at a few GB of f32 activations. The last up
+  block reads 288 ch at 1024x1024, which is 1.2 GB per buffer. At 2048 that is
+  4x, so VAE memory, not the transformer, limits the maximum size.
 
 ## Order of work
 
-Do this one component at a time, in one checkout. Parity runs load tens of GB
-and all builds share the same object files, so parallel builds or model runs
-will collide.
+Work one component at a time, in one checkout. Parity runs load tens of GB and
+all builds share the same object files, so parallel builds or model runs will
+collide. Each milestone ends with a passing comparison and a commit.
 
-1. Record the baseline, then write `debug/qimage_reference.py` (see below). Run
-   it on Turbo at 256x256, seed 42, dumping per-block states.
-2. Text encoder: match `tokens.txt` and `emb.bin`.
-3. Scheduler: match `sigmas.txt` for Turbo and for base at a few step counts.
-4. Transformer: CPU path first, compare `block<l>_s<i>.bin` and `step<i>_v.bin`,
-   then the device path.
-5. VAE: decode `latent.bin`, compare with `image.bin`.
-6. Routing, CLI, downloads, tests and docs.
-7. Check end to end, and that FLUX.3 did not regress.
+| # | Milestone | Done when |
+|---|---|---|
+| M0 | Baseline + `debug/qimage_reference.py` | Turbo 256x256 seed 42 dumps exist; FLUX.3 `make test` baseline recorded |
+| M1 | Loader detection + scheduler | `sigmas.txt` matches for Turbo and base at 4, 20, 40 steps, at 256 and 1024 px |
+| M2 | Text encoder | `tokens.txt`, `drop_idx.txt` exact; `emb.bin` within tolerance |
+| M3 | Transformer, CPU | `rope_*.bin`, `block<l>_s0/s1.bin`, `step<i>_v.bin` within tolerance |
+| M4 | Transformer, device | device and CPU paths agree; same reference tolerances |
+| M5 | VAE decoder, CPU then device | `latent.bin` decodes to `image.bin` within tolerance |
+| M6 | Routing, CLI, REPL, downloads, tests, docs | end-to-end images; `make test` passes; FLUX.3 matches its baseline |
 
-## Reference script
+## M0. Reference script
 
 Write `debug/qimage_reference.py`, modelled on `debug/flux3_reference.py`. Run
-the official `QwenImage21Pipeline` in float32 on the CPU, encoding text first and
-freeing the encoder before loading the transformer. Accept `--noise FILE` to
-start from C noise, and a way to only decode a given latent.
+the official `QwenImage21Pipeline` in float32 on the CPU with `use_kv_cache=True`
+(the default), encoding text first and freeing the encoder before loading the
+transformer. Accept `--noise FILE` to start from C noise, and `--decode FILE` to
+only decode a given latent.
 
 Dump as raw little-endian float32:
 
 | File | Contents |
 |---|---|
-| `tokens.txt`, `drop_idx.txt` | encoder token ids, leading system tokens dropped |
-| `emb.bin` | text embeddings `[txt_seq, 4096]` |
+| `tokens.txt`, `drop_idx.txt` | encoder token ids (full template), and `pipe._drop_idx` |
+| `emb.bin` | text embeddings after the drop `[L, 4096]` |
 | `noise.bin` | initial noise `[64, H/16, W/16]` |
-| `sigmas.txt` | schedule, `num_steps + 1` values |
-| `rope_cos.bin`, `rope_sin.bin` | first-step RoPE tables `[txt_seq + img_seq, 64]` |
-| `step<i>_v.bin`, `step<i>_x.bin` | velocity and latent tokens per step `[img_seq, 64]` |
+| `sigmas.txt` | `scheduler.sigmas`, `num_steps + 1` values |
+| `rope_cos.bin`, `rope_sin.bin` | first-step RoPE tables `[L + N, 64]` (real/imag of `pos_embed` output) |
+| `step<i>_v.bin`, `step<i>_x.bin` | velocity and latent tokens per step `[N, 64]` |
 | `block<l>_s<i>.bin` | hidden states after block l, steps 0 and 1 |
 | `latent.bin` | final latent `[64, H/16, W/16]`, before denormalization |
-| `image.bin`, `image.png` | decoded image, `[4, H, W]` in [-1, 1] |
+| `image.bin`, `image.png` | decoded image `[4, H, W]` in [-1, 1] |
 
-With the KV cache on, block dumps cover `[txt_seq + img_seq, 4096]` at step 0
-and `[img_seq, 4096]` after it. Capture tensors with forward hooks on the
-transformer, its blocks and `pos_embed`, and `callback_on_step_end` for latents.
+`L` is the text length after the drop and `N = (H/16) * (W/16)`. Block dumps
+cover `[L + N, 4096]` at step 0 (extract mode) and `[N, 4096]` after it. Capture
+them with forward hooks on the transformer blocks and `pos_embed`, and use
+`callback_on_step_end` for the latents. Also print the scheduler config the
+pipeline loaded. M1 needs it.
 
-## 1. Loader and routing
+## M1. Loader detection and scheduler
 
-- New flag `is_qimage` in `iris_load_dir` ([iris.c:272](iris.c)). Detect
-  `QwenImage21Pipeline` in `model_index.json`. Turbo is marked by a
-  `sample_sigmas` key, which is also how upstream tells them apart.
+### Detection (`iris_load_dir`, iris.c:272)
+
+- New flag `is_qimage`. Detect `"QwenImage21Pipeline"` in `model_index.json`.
+  Turbo is marked by a non-null `sample_sigmas` array in that file. Parse and
+  store it (`ctx->qimage_sigmas`, `ctx->qimage_num_sigmas`).
 - `model_index.json` has no `is_distilled`, so the current logic would mark
-  both as base models and send them down the CFG path. Neither uses CFG.
-- Text dim comes from `context_in_dim` (4096), not `joint_attention_dim`.
-- Defaults: 40 steps base, 8 Turbo, no guidance, `is_non_commercial = 1`.
-- The VAE load at iris.c:502 will fail on this checkpoint, so branch there.
-- Add `qimage` cases to every `is_zimage` / `is_flux3` site in `iris.c`,
-  `iris_cli.c` and `main.c`, including step previews (`iris_step_image_vae`
-  assumes the Flux VAE type).
-- Sizes must be multiples of 32, because the transformer groups image tokens
-  2x2. Upstream floors them; the Flux paths floor to 16.
-- `IRIS_VAE_MAX_DIM` (1792) is below the model's recommended sizes (up to
-  2752x1536), so this VAE needs its own limit.
+  both models as base and send them down the CFG path (iris.c:308). Set
+  `is_distilled = 1` for both. Neither uses CFG.
+- Text dim is `context_in_dim` (4096) from `transformer/config.json`, not
+  `joint_attention_dim`.
+- Defaults: 40 steps base, `len(sample_sigmas)` for Turbo, guidance 0,
+  `is_non_commercial = 1`.
+- The Flux VAE load (iris.c:506) would fail on this checkpoint. Branch there
+  to `iris_vae_load_qimage()`.
 
-Naming: `_qimage` suffix per CLAUDE.md. New files `iris_transformer_qimage.c`
-and `iris_vae_qimage.c`.
+### Scheduler (`iris_schedule_qimage`, iris_sample.c)
 
-## 2. Text encoder
+The spec's earlier claim, "Turbo: append 0, no shift", is not what upstream
+does. The pipeline passes `sample_sigmas` (Turbo) or `linspace(1, 1/n, n)`
+(base) into the same `scheduler.set_timesteps(sigmas=..., mu=mu)`, which then
+applies the scheduler's configured processing to either:
 
-The encoder (Qwen3-VL 8B text model) has the same shape as the 9B Qwen3: hidden
-4096, 36 layers, 32 query heads, 8 KV heads, `rope_theta` 5e6, read from config.
-Tensors are under `model.language_model.`, already handled.
+```
+sigmas = turbo ? sample_sigmas : linspace(1, 1/n, n)
+if use_dynamic_shifting:                         # [config]
+    mu = base_shift + (N - base_seq) * (max_shift - base_shift) / (max_seq - base_seq)
+    sigmas = exp(mu) / (exp(mu) + (1/sigmas - 1))        # time_shift_type "exponential"
+             (or mu / (mu + (1/sigmas - 1)) for "linear")
+else:
+    sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
+if shift_terminal:                               # [config]
+    sigmas = 1 - (1 - sigmas) / ((1 - sigmas[-1]) / (1 - shift_terminal))
+append 0
+```
 
-- Add `QWEN3_EXTRACT_QIMAGE` in `qwen3_output_layers` (iris_qwen3.c:296):
-  `layers[0] = num_layers - 1`. Upstream needs the last layer **before** the
-  final norm. iris loads that norm but never applies it, so this works as is.
-- Template, built as a raw string (no `<think>`):
+- Read every value from `scheduler/scheduler_config.json` (`use_dynamic_shifting`,
+  `base_image_seq_len`, `max_image_seq_len`, `base_shift`, `max_shift`,
+  `shift`, `shift_terminal`, `time_shift_type`). Fall back to the diffusers
+  defaults (256, 4096, 0.5, 1.15, 1.0, none, exponential) when a key is absent.
+- `N` is the target token count `(H/16) * (W/16)`, not clamped.
+- The old notes put base at `mu = 0.5 + (N - 256) * 0.4 / 7936` with terminal
+  0.02, i.e. `max_image_seq_len` 8192, `max_shift` 0.9, `shift_terminal` 0.02.
+  Treat that as a hypothesis for the base config.
+- Turbo's listed grid (`1.0, 0.978453, ..., 0.414568`) only survives unchanged
+  if Turbo's scheduler config disables dynamic shifting, has `shift` 1.0 and no
+  `shift_terminal`. The stretch would map the last value to 0.02. Verify with
+  `sigmas.txt`. Do not special-case Turbo in C: the generic code gives the
+  right answer either way.
+- `--steps` on Turbo: upstream ignores `num_inference_steps` when
+  `sample_sigmas` is set. Ignore it too and print a notice. `--linear` and
+  `--power` keep overriding, as for the other families.
+- Euler: `x += (sigma_next - sigma) * v`. The model timestep is the sigma
+  itself: the pipeline passes `t / 1000` with `t = sigma * 1000`.
+- Reuse `generalized_time_snr_shift` (iris_sample.c:160) for the exponential
+  shift.
+
+## M2. Text encoder (iris_qwen3.c, iris_qwen3_tokenizer.c)
+
+The encoder (Qwen3-VL 8B text model) has the same shape as the Flux 9B Qwen3:
+hidden 4096, 36 layers, 32 query heads, 8 KV heads, `rope_theta` 5e6, all read
+from config. Tensors are under `model.language_model.`, which
+`qwen3_detect_variant` already handles. That also sets `max_seq_len` to
+`QWEN3_VL_MAX_SEQ_LEN` (1280). Since 41fc94e, Metal attention covers all 1280
+positions, so the old `seq_len <= 512` concern is gone.
+
+- **Extraction**: add `QWEN3_EXTRACT_QIMAGE` to `qwen3_output_layers`
+  (iris_qwen3.c:296) with `layers[0] = num_layers - 1`. Upstream wants the last
+  decoder layer's output **before** the final norm. It hooks the norm away
+  because transformers 5 would normalize `hidden_states[-1]`. iris loads
+  `norm_weight` (iris_qwen3.c:1800) but never applies it, so this works as is.
+  The layer loop already stops at the last extracted layer, which is now 35.
+- **Template**: a raw string, not `apply_chat_template`. Upstream says the two
+  tokenize differently. There is no `<think>` block:
 
   ```
   <|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
   ```
 
-- Drop the leading system tokens from the output. Upstream takes the count from
-  the tokenized system message; `drop_idx.txt` has the expected value.
+  `qwen3_tokenize_chat` (iris_qwen3_tokenizer.c:991) has no system message.
+  Add `qwen3_tokenize_chat_system(tok, system, prompt, ...)`, or a `system`
+  argument, and share the existing piece-by-piece code. Special tokens and
+  `\n` are pre-token boundaries under the Qwen2 split regex, so tokenizing the
+  pieces separately equals tokenizing the whole string.
+- **Drop index**: upstream drops `len(apply_chat_template(system message))`
+  tokens, i.e. the tokens of
+  `<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n`.
+  Compute it in C the same way, by tokenizing that block alone, and check it
+  against `drop_idx.txt`. Everything after it is kept, including the trailing
+  `<|im_start|>assistant\n` tokens.
 - An empty prompt becomes `" "`.
-- Only real tokens reach the transformer, as Z-Image does at iris.c:720.
-- Variable lengths hit two limits: the GPU causal kernels (CLAUDE.md FLUX.3
-  pitfall 2) and the `seq_len <= 512` check at iris_qwen3.c:1136. Suggested
-  approach, unproven: pad to a multiple of 80 like FLUX.3, then trim. Causal
-  attention should leave real tokens unchanged; confirm against `emb.bin`.
-- Loader gaps:
-  - Add a `processor/tokenizer.json` fallback (near iris_qwen3.c:2024).
-  - Add single-file `model.safetensors` support (iris_qwen3.c:1764 only falls
-    back to two shards). Needed for Hub Turbo downloads.
+- **Truncation**: upstream never truncates. iris must cap at 1280 tokens.
+  Truncate the prompt body, not the tail, so the template suffix survives, and
+  warn as the tokenizer already does since d3c1060.
+- **Padding**: pad to a multiple of `QWEN3_FLUX3_PAD_MULTIPLE` (80) as FLUX.3
+  does, then keep only the real tokens. Pads sit after every real token and
+  the encoder is causal, so they cannot change real tokens. Keep
+  `pad_at_one` (iris_qwen3.c:280) FLUX3-only: pad RoPE positions do not matter
+  here. Generalize `qwen3_encode_text_ex` so its FLUX3 branches become
+  "VL modes", and return the post-drop embeddings `[L, 4096]`. Only real tokens
+  reach the transformer, as for Z-Image (iris.c:720).
+- **Loader gaps**:
+  - Tokenizer fallback: `processor/tokenizer.json`, after the two existing
+    paths (iris_qwen3.c:2024).
+  - Single-file `text_encoder/model.safetensors` (iris_qwen3.c:1764 only knows
+    the index file and the two-shard pattern). Hub Turbo downloads need it.
+- **Acceptance**: `tokens.txt` exact, `drop_idx` exact, `emb.bin` max abs
+  error within the FLUX.3 encoder tolerance, on CPU and on one GPU build.
 
-## 3. Scheduler
+## M3/M4. Transformer (new `iris_transformer_qimage.c`)
 
-Euler: `x += (sigma_next - sigma) * v`. The timestep passed to the model is the
-sigma itself.
+Config **[config]**: dim 4096 (`num_attention_heads * attention_head_dim`),
+heads 32, head_dim 128, 32 blocks, `mlp_ratio` 3 (12288), in/out channels 64,
+`patch_size` 1, `axes_dims_rope` `[16, 56, 56]`, eps 1e-6,
+`causal_condition` true. RoPE theta 10000 is hardcoded upstream, not in the
+config. No linear has a bias, including the timestep MLP.
 
-- Turbo: read the 8 values from `model_index.json`, append 0, no shift.
-  `--steps` must not change them:
+### Forward, as verified upstream
 
-  `1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568`
+The sequence is `[TEXT (L) | TARGET (N)]`, with target tokens in raster order
+and no patchify. With no condition images, `img_mask` is L false slots plus
+N/4 true slots, each expanded 4x, so the joint layout is exactly
+`[L text, N target]`.
 
-- Base: `linspace(1, 1/n, n)`, exponential time shift (reuse
-  `generalized_time_snr_shift`, iris_sample.c:160), stretch to terminal 0.02,
-  append 0.
-  - `mu = 0.5 + (seq - 256) * 0.4 / 7936`, where `seq` is the target token
-    count. It is not clamped, so it exceeds 0.9 at high resolution.
-  - The stretch is `1 - (1 - s) / ((1 - s_last) / (1 - 0.02))`. That formula is
-    from memory of diffusers, so check it against `sigmas.txt`.
+1. **Timestep embedding**: `arg = 1000 * sigma * exp(-ln(10000) * j / 128)`,
+   `j < 128`; `emb = [cos(arg) | sin(arg)]` (cos first), then
+   `time_text_embed.timestep_embedder.linear_1`, SiLU, `linear_2`. This gives
+   `temb_t` for target tokens. `temb_0` (sigma = 0) is used for text.
+2. **Modulation**: `mod = modulation.1(silu(temb))` -> `[scale1 | gate1 |
+   scale2 | gate2]`, each `dim` wide. One vector is shared by **all 32 blocks**.
+   The docstring says "slices", but the code passes the same tensor to each
+   block. Text uses `mod(temb_0)`, target uses `mod(temb_t)`.
+3. **Text input**: `n = x * rsqrt(mean(x^2) + 1e-6) * (txt_in.text_norm.weight + 1)`
+   (zero-centered weight, the only such norm here), then `in_layer`,
+   GELU-tanh, `out_layer`.
+4. **Target input**: `img_in` (64 -> dim).
+5. **Block** (sequential, unlike FLUX.3's parallel block):
 
-## 4. Transformer
+   ```
+   a = attn(LayerNorm(x) * (1 + scale1));  x += tanh(gate1) * a
+   m = mlp(LayerNorm(x) * (1 + scale2));   x += tanh(gate2) * m
+   ```
 
-Config: dim 4096, heads 32, head_dim 128, 32 blocks, mlp 12288, in/out 64,
-patch 1, RoPE axes `[16,56,56]`, theta 10000 (not in the config), eps 1e-6.
-All linears have no bias.
+   LayerNorm has no affine part and no shift term.
+   `mlp(n) = out(silu(gate_layer(n)) * proj(n))`.
+6. **Attention**: `to_q/k/v` -> per-head RMSNorm (`attn.norm_q/k.weight`,
+   eps 1e-6) -> RoPE on Q and K -> SDPA, scale `1/sqrt(128)` -> `to_out.0`.
+   Text queries are **causal** over text keys. Target queries see every text
+   key and every target key (bidirectional within the target).
+7. **RoPE**: per axis with dim `d`, pair `j < d/2` has frequency
+   `10000^(-2j/d)`. The three axes are concatenated (8 + 28 + 28 = 64 pairs) and
+   rotate **consecutive** pairs (`view_as_complex` of `[..., 64, 2]`). That is
+   `iris_dev_head_norm_rope(..., split_half = 0)`, which fuses step 6's norm.
+   Positions: text token `i` -> `(i, i, i)`. Target token `(r, c)` ->
+   `(L, r - (Hl - Hl/2), c - (Wl - Wl/2))`, with `Hl = H/16`, `Wl = W/16`. That
+   is `range(-(Hl - Hl//2), Hl//2)`, which can be negative. Upstream's table
+   wraps negative indices onto a separately built negative half, and that equals
+   computing the angle from the signed position directly.
+8. **Output**: `scale = norm_out.linear(silu(temb_t))` (scale only, no shift),
+   `LayerNorm(x) * (1 + scale)`, `proj_out` -> 64. Target tokens only.
 
-Sequence is `[TEXT | TARGET]`. Target tokens are raster order, no patchify.
+### Design: prefill once, then one target-only path
 
-- Timestep: sinusoidal 256 dims of `sigma * 1000`, cos half first, max period
-  10000, then `time_text_embed.timestep_embedder.linear_1`, SiLU, `linear_2`.
-- Text input: RMSNorm with effective weight `txt_in.text_norm.weight + 1`
-  (zero-centered, unlike every other norm here), `in_layer`, GELU
-  (`approximate="tanh"`), `out_layer`.
-- `img_in`: linear from 64.
-- `modulation.1`: `linear(silu(temb))` gives `[scale1, gate1, scale2, gate2]`,
-  one projection shared by all blocks. Text uses the embedding of t=0, target
-  uses t.
-- Block, sequential (unlike FLUX.3's parallel form):
+Text never attends to the target, and text is modulated from t = 0, so text
+activations depend on neither the target nor the step. That is why upstream can
+use a KV cache. Do the same, but compute the prefix once **before** sampling
+rather than inside step 0:
+
+- `qimage_prefill(tf, txt_emb, L)`: run the text alone through the 32 blocks
+  with `mod(temb_0)` and causal attention. Store each block's post-norm,
+  post-RoPE K and V, `[L, 2*dim]` bf16 per block: about 0.5 MB per token in
+  total, so 50 MB for 100 tokens and 670 MB for 1280. Block 31's text attention
+  output and MLP are never used, so the prefill can stop after block 31's K/V
+  projection.
+- Every step, including step 0: target queries attend to
+  `[prefix K/V, target K/V]` with no mask.
+- Same math as upstream with the cache on. It matches only to rounding, since
+  upstream documents that the cache changes reduced-precision samples. Compare
+  against the float32 cache-on reference.
+- Each step then has exactly one modulation vector, so no per-token modulation
+  API is needed.
+- Keep the prefix in the transformer struct, keyed on the embedding contents.
+  Repeated generations with the same prompt (REPL, `--seed` sweeps) skip the
+  prefill.
+
+### Device memory layout (resolves the earlier "main design job")
+
+`iris_dev_attention` requires q, k and v to share one row stride. Use a fused
+QKV scratch buffer `qkv [L + N, 3*dim]` bf16, one per model, reused by every
+block:
+
+1. The target QKV GEMM (fused `[to_q; to_k; to_v]` weight, assembled on the
+   device at load like FLUX.3's fused weights) writes rows `[L, L + N)`.
+2. Copy the block's cached prefix K|V `[L, 2*dim]` into rows `[0, L)`, columns
+   `[dim, 3*dim)`.
+3. `iris_dev_head_norm_rope` on the Q and K column ranges of the target rows
+   (`ld = 3*dim`, RoPE rows for the target only).
+4. `iris_dev_attention(out, dim, q = qkv + L*3dim, k = qkv + dim, v = qkv + 2dim,
+   ldi = 3*dim, seq_q = N, seq_k = L + N, heads = kv_heads = 32, causal = 0)`.
+   This hits the flash kernel (head_dim 128, non-causal).
+
+Step 2 needs a **new device API**: `iris_dev_copy_2d(dst, dst_stride, src,
+src_stride, row_bytes, rows)`, a device-to-device copy that stays
+stream-ordered. CUDA/HIP: `MemcpyAsync2D` with `DeviceToDevice` on `g_stream`.
+Metal: a blit encoder in the current command buffer. A CPU `memcpy` would force
+a flush per block (32 per step). The rejected alternative is per-block
+`[L + N]` K/V buffers, which need no copy but cost 2.2 GB at 1 MP and 8.6 GB at
+4 MP.
+
+The prefill uses the same buffer with `seq_q = seq_k = L`, `causal = 1`.
+Causal attention misses the flash kernel and takes the GEMM + softmax fallback,
+which is fine at L <= 1280 and done once per prompt.
+
+Other kernels already exist:
+
+- `iris_dev_layer_norm_mod` with `shift = NULL`.
+- `iris_dev_residual` with a `tanh(gate)` vector computed on the host (4 x 4096
+  values per step).
+- `iris_dev_swiglu` on a fused `[gate_layer; proj]` GEMM output (`ldi = 2*mlp`),
+  as FLUX.3 does.
+
+The text-input GELU-tanh runs once per prompt, so the CPU is fine for it.
+
+### CPU path
+
+Same structure on f32/bf16 weights with BLAS GEMMs. The per-head attention
+takes a causal flag for the prefill. Reuse `iris_kernels.c` helpers (LayerNorm,
+RMSNorm, SiLU, GELU) rather than adding copies.
+
+### API
+
+```c
+iris_transformer_qimage_t *iris_transformer_load_qimage(const char *model_dir);
+void  iris_transformer_free_qimage(iris_transformer_qimage_t *tf);
+int   iris_transformer_prefill_qimage(iris_transformer_qimage_t *tf,
+                                      const float *txt_emb, int txt_len);
+float *iris_transformer_forward_qimage(iris_transformer_qimage_t *tf,
+                                       const float *x, int hl, int wl, float sigma);
+float *iris_sample_euler_qimage(void *tf, float *z, int hl, int wl,
+                                const float *txt_emb, int txt_len,
+                                const float *sigmas, int num_steps, ...);
+```
+
+### Acceptance
+
+RoPE tables exact to float rounding. Block states and step velocities within
+tolerance at steps 0 and 1, CPU first, then device vs CPU on one MPS and one
+BLAS build.
+
+## M5. VAE decoder (new `iris_vae_qimage.c`)
+
+It is not the Flux VAE. It is Wan-derived and specialized to one frame:
+`QwenImage21CausalConv3d` subclasses `nn.Conv2d`, stores 2D weights
+`[out, in, k, k]`, and pads symmetrically (k=3, pad 1). Ignore every
+`time_conv` weight: with one frame and `first_chunk = True`, upstream never runs
+them. Load decoder tensors and `post_quant_conv` only.
+
+Config **[config]**: `z_dim` 64, `decoder_base_dim` 144, `dim_mult
+[1,2,4,8,8]`, `num_res_blocks` 2, `temperal_downsample [F,T,T,T]`,
+`is_residual` true, `out_channels` 4, `patch_size` null. `latents_mean` and
+`latents_std` have 64 values each. Denormalize with `latent * std + mean`.
+If `patch_size` is set and > 1, fail clearly. Upstream would unpatchify.
+
+Decode:
+
+```
+x = post_quant_conv(z)                         # 1x1, 64->64, bias
+x = conv_in(x)                                 # 3x3, 64->1152
+x = mid: res(1152), attn(1152), res(1152)
+x = up_blocks[0..4]
+x = conv_out(silu(norm_out(x)))                # 144->4
+clamp to [-1, 1]
+```
+
+- Up block channels (`dims = 144 * [8,8,8,4,2,1]`, `is_residual` keeps in_dim):
+  1152->1152, 1152->1152, 1152->576, 576->288, 288->144. The first four
+  upsample. Each has 3 res blocks (`num_res_blocks + 1`).
+- **Norm** (`QwenImage21RMS_norm`): `x / max(||x||_2, 1e-12) * sqrt(C) * gamma`
+  over the channels of each pixel. That is RMS normalization with no eps inside
+  the root. Gamma is stored `[C,1,1,1]`. No bias.
+- **Res block**: `h = conv_shortcut(x)` (1x1 with bias, only when channels
+  differ), then norm1, SiLU, conv1 (3x3), norm2, SiLU, conv2 (3x3), `+ h`. The
+  shortcut reads the block input, before norm1.
+- **Mid attention**: one head over all latent pixels, head dim = C = 1152.
+  `n = norm(x)`; `to_qkv` 1x1 conv with bias -> channels `[q | k | v]`; SDPA with
+  scale `1/sqrt(1152)`; `proj` 1x1 with bias; `+ x`. Head dim 1152 rules out
+  flash attention. At 2048 px there are 16384 latent pixels and a 1 GiB f32
+  score matrix, so chunk the queries on CPU.
+- **Up block** (`QwenImage21ResidualUpBlock`): `x_copy = x`; 3 res blocks;
+  upsampler = nearest 2x (`nearest-exact` equals nearest at 2x) then the 3x3
+  conv at `upsampler.resample.1` (out->out); then `x += dup_up(x_copy)`.
+- **DupUp shortcut, in closed form.** Earlier notes said "easy to get wrong".
+  Derived from `QwenImage21DupUp3D.forward` with `first_chunk = True`:
 
   ```
-  a = attn(LayerNorm(x) * (1 + scale1));  x += tanh(gate1) * a
-  m = mlp(LayerNorm(x) * (1 + scale2));   x += tanh(gate2) * m
+  ft      = temperal_upsample[i] ? 2 : 1      # temperal_upsample = reversed(temperal_downsample)
+  repeats = out_ch * ft * 4 / in_ch
+  out[o, 2y+i, 2x+j] = in[(((o*ft + ft-1)*2 + i)*2 + j) / repeats, y, x]
   ```
 
-  No shift. `mlp(n) = out(silu(gate_layer(n)) * proj(n))`, three linears.
-- Attention: separate `to_q/k/v`, `to_out.0`; per-head RMSNorm on Q and K using
-  `attn.norm_q/k.weight` directly; RoPE on Q and K only; scale `1/sqrt(128)`.
-  iris's consecutive-pair rotation matches upstream's complex multiply.
-- RoPE: text token i sits at `(i, i, i)`. Target tokens sit at
-  `(T, h, w)` with T the text length, and `h`, `w` centred:
-  `range(-(H - H//2), H//2)`.
-- Output: `norm_out.linear(silu(temb))` gives scale only,
-  `LayerNorm(x) * (1 + scale)`, then `proj_out` to 64. Target tokens only.
+  With the default config (`ft = 2,2,2,1` for up blocks 0..3):
+  - blocks 0, 1 (1152->1152, repeats 8): `src = o`, plain nearest 2x.
+  - block 2 (1152->576, repeats 4): `src = 2o + 1`, odd input channels only.
+  - block 3 (576->288, repeats 2): `src = 2o + i`, which depends on the output
+    row parity.
 
-### Design decision: prefill once, then one code path
+  Implement the general formula: one CPU loop and one device kernel. Test it
+  against a tiny PyTorch run of `QwenImage21DupUp3D` for each block shape.
+- Conv weights are `[out, in, k, k]`. `iris_dev_conv2d` wants channels-last
+  `[out, (ky*k + kx)*in + c]` in bf16, so repack at load, as `iris_vae.c` does.
+  The F32 base VAE converts at load. The BF16 Hub VAE uploads directly.
+- Tensor names are inferred from the module tree. Confirm them against the
+  safetensors header before writing the loader: `decoder.conv_in`,
+  `decoder.mid_block.resnets.{0,1}.{norm1.gamma,conv1,norm2.gamma,conv2}`,
+  `decoder.mid_block.attentions.0.{norm.gamma,to_qkv,proj}`,
+  `decoder.up_blocks.{i}.resnets.{j}.{...,conv_shortcut}`,
+  `decoder.up_blocks.{i}.upsampler.resample.1`, `decoder.norm_out.gamma`,
+  `decoder.conv_out`, `post_quant_conv`.
+- **Device path**: one implementation for CUDA, ROCm and Metal on
+  `iris_dev.h`. `iris_dev_conv2d` and `iris_dev_upsample2x` exist on all three.
+  This differs from `iris_vae.c`, whose device path is compiled out on MPS.
+  New kernels:
+  1. `iris_dev_pixel_rms_norm(out, in, gamma, hw, c, silu)`: f32 in and out,
+     the norm above, optional fused SiLU. The existing `iris_dev_rms_norm`
+     writes bf16 and adds eps.
+  2. `iris_dev_dup_up(out, in, h, w, cin, cout, ft)`: the formula above.
 
-Upstream runs step 0 in "extract" mode and later steps in "cached" mode. Text
-never attends to the target, so its activations do not depend on the target or
-the step. Run the text through all 32 blocks once before sampling, with t=0
-modulation and causal attention (`iris_dev_attention` with `causal=1`), storing
-post-RoPE K and V per block. Every step then computes target queries against
-`[prefix KV, target KV]`, including step 0.
+  The mid attention can use `iris_dev_linear` for the 1x1 convs plus
+  `iris_dev_attention` with head_dim 1152, which takes the GEMM fallback.
+- **Output**: always 4 channels (RGBA). `iris_image` and PNG support RGBA, PPM
+  drops alpha. For opaque results, consider writing RGB when every alpha value
+  rounds to 255. Check what the reference image mode is first.
+- **Size cap**: `IRIS_VAE_MAX_DIM` (1792) is below the recommended sizes (up to
+  2752x1536). Give this VAE its own limit, `IRIS_QIMAGE_MAX_DIM`, sized from
+  measured decode memory.
 
-The math is the same, but results match upstream only to rounding. Upstream
-documents that toggling its KV cache changes samples in reduced precision, so
-compare against a cache-enabled reference in float32.
+## M6. Routing and plumbing
 
-This also means each transformer call has a single modulation vector, so no new
-per-token modulation API is needed. Prefix cost is about 0.16 GB for 300 tokens.
-
-Device API notes:
-- `iris_dev_attention` already takes `seq_q != seq_k`, but q, k and v share one
-  row stride, so prefix and target K/V must be laid out contiguously. Working
-  out that layout per block is the main design job here.
-- `iris_dev_layer_norm_mod` works with `shift = NULL`.
-- `iris_dev_residual` has no tanh. Pass `tanh(gate)` as its gate vector.
-- FLUX.3's device path shows weight fusing, but its blocks are parallel. These
-  are sequential, so the fusing differs.
-
-## 5. VAE
-
-Not the Flux VAE. It is Wan-derived and handles a single frame, so everything
-is 2D: `QwenImage21CausalConv3d` subclasses `nn.Conv2d` and stores 2D weights.
-Ignore every `time_conv` weight and all feature caching. Load decoder tensors
-only.
-
-Config: z 64, decoder base 144, `dim_mult [1,2,4,8,8]`, 2 res blocks, RGBA out.
-Latent denormalization is `latent * std + mean`, with 64 values each in
-`vae/config.json`.
-
-Decode: `post_quant_conv` (1x1), `conv_in`, mid block, 5 up blocks,
-`norm_out`, SiLU, `conv_out`, clamp to [-1, 1].
-
-- Mid block: res, attention, res. There is attention even though `attn_scales`
-  is empty. It is single-head over all pixels at latent resolution: norm,
-  `to_qkv` (1x1 to 3c), SDPA with scale `1/sqrt(c)`, `proj` (1x1), plus identity.
-- Up block channels: 1152→1152, 1152→1152, 1152→576, 576→288, 288→144. The
-  first four upsample. Each has 3 res blocks.
-- Res block: `h = conv_shortcut(x)` if the channels differ, else x; then norm1,
-  SiLU, conv1, norm2, SiLU, conv2; add h.
-- Norm is per-pixel RMS, not GroupNorm: `x / rms(x over channels) * gamma`.
-- Up block: keep `x_copy`, run res blocks, then the upsampler (nearest 2x, conv
-  at `upsampler.resample.1`), then add the shortcut of `x_copy`.
-- Shortcut (`QwenImage21DupUp3D`): `repeat_interleave` channels by
-  `out * factor / in`, fold into `[out, t, s, s]`, pixel-shuffle, and with
-  `first_chunk=True` keep only temporal slot `factor_t - 1`. This is easy to get
-  wrong. `factor_t` comes from the reversed `temperal_downsample`; check that
-  against `QwenImage21Decoder3d` and `AutoencoderKLQwenImage21.__init__`.
-
-`iris_dev_conv2d` and `iris_dev_upsample2x` exist on CUDA, ROCm and Metal, so
-one device path can serve all GPUs. That differs from `iris_vae.c`, whose device
-path is compiled out on MPS. New kernels needed: per-pixel RMS norm with f32
-output, and pixel shuffle.
-
-Tensor names for the mid-block attention are inferred from the class. Confirm
-them against the safetensors header.
-
-Output has 4 channels, always. `iris_image` and PNG support RGBA; PPM drops
-alpha. Check what the reference does for opaque images (it prints the mode).
-
-## 6. Plumbing
-
-- Makefile `SRCS` and dependency lines.
-- `download_model.py` and `download_model.sh` entries. Note the licence there.
-- `run_test.py`: `is_qimage_model_dir`, a `--qimage-model-dir` flag, and a test.
-- Test vector in `test_vectors/`, generated from **iris's** noise for the seed
-  (`iris_init_noise`) via `--noise`, as the FLUX.3 vectors were.
-- README and CLAUDE.md: variants, file structure, architecture, pitfalls.
+- `iris.c`: `iris_is_qimage()`, `iris_generate_qimage()` (encode, release the
+  encoder, load the transformer, prefill, sample, decode),
+  `iris_load_qimage_transformer_if_needed()`. Add `qimage` cases at every
+  `is_zimage` / `is_flux3` site: iris.c 460, 473, 577, 663, 694-720, 1149,
+  1283, 1382, 1551, 1761, 1995, 2010. `iris_img2img` and `iris_multiref` must
+  refuse with a clear error until Phase 2.
+- `iris_encode_text`: select `QWEN3_EXTRACT_QIMAGE` and return the real token
+  count, as for Z-Image.
+- Sizes: floor to multiples of 32. The pipeline floors to `vae_scale_factor * 2`
+  and the Flux paths floor to 16.
+- Noise: `iris_init_noise` into `[64, H/16, W/16]`, packed to `[N, 64]` raster
+  order (`_pack_latents`).
+- Step previews: `iris_step_image_vae` assumes the Flux VAE type. Route it
+  through the qimage decoder, or disable previews for qimage at first and
+  say so.
+- `iris_cli.c` (REPL) and `main.c`: help text defaults (40 / 8 steps, no
+  guidance), the scheduler name (iris_cli.c:85), and the `is_zimage` branches
+  at iris_cli.c:365-1134. Base and Turbo both use the distilled-style path
+  (no CFG). Do not reuse the FLUX.3 base CFG route.
+- `iris.h`: declare `iris_is_qimage`.
+- Makefile: add `iris_transformer_qimage.c` and `iris_vae_qimage.c` to `SRCS`,
+  plus dependency lines like iris_transformer_flux3.o (Makefile:228).
+- `download_model.py` / `download_model.sh`: `qimage` and `qimage-turbo`
+  entries, with the licence and disk size noted.
+- `run_test.py`: `is_qimage_model_dir`, `--qimage-model-dir`, and a 256x256
+  Turbo test. Generate the vector from **iris's** noise for the seed via
+  `--noise`, as the FLUX.3 vectors were.
+- README and CLAUDE.md: variants, file structure, architecture, pitfalls
+  (including the new `iris_dev_copy_2d`, `iris_dev_pixel_rms_norm` and
+  `iris_dev_dup_up` in the device-backend section).
 
 ## Acceptance
 
-- `emb.bin`, `sigmas.txt`, step velocities and `image.bin` match the reference,
-  with the tolerances you used stated in the final report.
+- `tokens.txt`, `drop_idx.txt` exact. `emb.bin`, `sigmas.txt`, step velocities
+  and `image.bin` match the reference, with the tolerances used stated in the
+  final report.
 - `./iris -d ~/GenAI/models/Qwen-Image-2.1-Turbo -p "a fish" -W 1024 -H 1024 -o
   /tmp/q.png` gives a sensible image. Do the same for base.
 - Device and CPU paths agree on one MPS and one BLAS build.
@@ -268,32 +495,45 @@ alpha. Check what the reference does for opaque images (it prints the mode).
 - CUDA/ROCm builds compile if a toolchain is available. If not, say they were
   not built.
 
-## Expected cost
+## Risks
 
-Unmeasured. Block count and width are close to Flux 9B, so 8-step Turbo at 1024
-should take about twice 4-step 9B. At 2048 there are 4x the tokens and about
-16x the attention cost. Memory at 2K is unknown, including the VAE buffers.
+| Risk | Mitigation |
+|---|---|
+| Turbo/base scheduler configs differ from the assumptions above | Generic config-driven scheduler; `sigmas.txt` check in M1 |
+| Tensor names in the VAE/transformer headers differ from the module tree | Dump the safetensors headers in M0 before writing loaders |
+| Cache-on vs cache-off rounding confuses parity | Reference always runs `use_kv_cache=True` in float32 |
+| VAE memory at 2K+ | Separate size cap; tiling stays out of scope |
+| Prompts over 1280 tokens | Truncate the body, keep the template tail, warn |
+| Metal `iris_dev_copy_2d` forcing syncs | Blit in the current command buffer, never a host memcpy |
 
 ## Phase 2: reference images and editing (separate task)
 
 Much bigger than Phase 1:
 
-- VAE encoder (residual down blocks with `QwenImage21AvgDown3D`).
+- VAE encoder: residual down blocks with `QwenImage21AvgDown3D`, `quant_conv`,
+  and the argmax latent normalized as `(z - mean) / std`.
 - Qwen3-VL vision tower: 27 layers, dim 1152, patch 16, merge 2, deepstack at
   8/16/24.
 - Qwen3 changes: `<|image_pad|>` substitution and 3-axis MRoPE (sections
   `[24,20,20]`, interleaved) on the CPU, Metal and device paths. Deepstack
-  injection into early text layers is assumed from Qwen3-VL's design; confirm it
-  in the transformers source.
-- Transformer: interleaved text and image blocks. Text after an image needs a
-  causal query offset, which `iris_dev_attention` lacks.
+  injection into early text layers is assumed from Qwen3-VL's design. Confirm
+  it in the transformers source.
+- Template: `<image1><|vision_start|><|image_pad|><|vision_end|>` per image
+  (`<image{i}>` with a leading space from the second image), before the prompt.
+- Transformer: each vision slot expands to 2x2 latent tokens and is
+  overwritten by that image's latents. Every image block is bidirectional
+  internally and causal toward everything after it. The RoPE frame axis
+  freezes at the preceding text position, then advances by `max(h, w)` after
+  each image block. A text segment after an image needs causal attention with
+  a query offset, which `iris_dev_attention` lacks.
 - Prefix KV memory: about 2.3 GB per 1 MP reference, about 22 GB for 10.
-- Reference preparation: RGBA, resized to about 1 MP on the 32-pixel grid;
-  composited over white for the vision encoder only.
+- Reference preparation: RGBA, resized to about 1 MP on the 32-pixel grid
+  (`calculate_dimensions`). The copy for the vision encoder only is composited
+  over white.
 
 Vision tokens are overwritten by latents in the transformer, so the tower only
-affects the text that follows the image. It still cannot be skipped: the
-checkpoint was trained with it.
+affects the text that follows the image. It still cannot be skipped, because
+the checkpoint was trained with it.
 
 ## Licence
 
@@ -307,7 +547,8 @@ of a derivative product.
   https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo
 - Project: https://github.com/QwenLM/Qwen-Image-2.1
 - Diffusers docs: https://huggingface.co/docs/diffusers/main/api/pipelines/qwenimage21
-- Diffusers source, also installed in the venv above:
+- Diffusers source (also installed in the venv above):
   - `src/diffusers/models/transformers/transformer_qwenimage21.py`
   - `src/diffusers/models/autoencoders/autoencoder_kl_qwenimage21.py`
   - `src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py`
+  - `src/diffusers/schedulers/scheduling_flow_match_euler_discrete.py`
