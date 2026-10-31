@@ -1245,7 +1245,7 @@ static iris_image *iris_generate_qimage_with_embeddings(iris_ctx *ctx,
     if (p.height < 64) p.height = 64;
     if (p.width > IRIS_QIMAGE_MAX_DIM || p.height > IRIS_QIMAGE_MAX_DIM ||
         (long)p.width * p.height > IRIS_QIMAGE_MAX_PIXELS) {
-        set_error("Image dimensions exceed maximum (2816 per side, 2048x2048 pixels)");
+        set_error("Image dimensions exceed maximum (2816 per side, 2752x1536 pixels)");
         return NULL;
     }
 
@@ -1306,9 +1306,19 @@ static iris_image *iris_generate_qimage_with_embeddings(iris_ctx *ctx,
         return NULL;
     }
 
+    /* A large decode can need more GPU memory than the transformer leaves. */
+    int evicted = 0;
+    if (!iris_vae_reserve_qimage(ctx->qimage_vae, latent_h, latent_w)) {
+        fprintf(stderr, "Note: unloading the transformer to fit the VAE on the GPU\n");
+        iris_transformer_free_qimage(ctx->qimage_transformer);
+        ctx->qimage_transformer = NULL;
+        evicted = 1;
+    }
+
     if (iris_phase_callback) iris_phase_callback("decoding image", 0);
     iris_image *img = iris_vae_decode_qimage(ctx->qimage_vae, latent, latent_h, latent_w);
     if (iris_phase_callback) iris_phase_callback("decoding image", 1);
+    if (evicted) iris_vae_release_qimage(ctx->qimage_vae);   /* room to reload it */
     free(latent);
     return img;
 }

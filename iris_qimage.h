@@ -14,11 +14,10 @@
 /* Latent channels (VAE z_dim, transformer in/out channels). */
 #define IRIS_QIMAGE_LATENT_CHANNELS 64
 
-/* Image size limits. The model recommends up to 2752x1536; the VAE decoder
- * needs several GB of activations at 4 MP, so the pixel count is capped
- * there. */
+/* Image size limits. The model recommends up to 2752x1536 and 1536x2752;
+ * the VAE decoder needs about 22 GB of GPU activations at 4 MP. */
 #define IRIS_QIMAGE_MAX_DIM    2816
-#define IRIS_QIMAGE_MAX_PIXELS (2048 * 2048)
+#define IRIS_QIMAGE_MAX_PIXELS (2752 * 1536)
 
 /* ========================================================================
  * Scheduler (iris_sample.c)
@@ -77,6 +76,13 @@ typedef struct iris_vae_qimage iris_vae_qimage_t;
 
 iris_vae_qimage_t *iris_vae_load_qimage(const char *model_dir);
 void iris_vae_free_qimage(iris_vae_qimage_t *vae);
+
+/* Allocate what a GPU decode of an h x w latent needs. Returns 0 if it does
+ * not fit, 1 if it does or there is no GPU. */
+int iris_vae_reserve_qimage(iris_vae_qimage_t *vae, int h, int w);
+
+/* Free the decoder's GPU activations, leaving its weights loaded. */
+void iris_vae_release_qimage(iris_vae_qimage_t *vae);
 
 /* Decode a normalized latent [z_dim, h, w] (as the transformer produces
  * it) into an RGBA image of 16h x 16w pixels. */

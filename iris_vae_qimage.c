@@ -481,9 +481,18 @@ static void dv_attention(iris_vae_qimage_t *vae, float *out, const float *x, flo
     iris_dev_add(out, x, (size_t)n * c);
 }
 
+int iris_vae_reserve_qimage(iris_vae_qimage_t *vae, int h, int w) {
+    if (!iris_dev_available()) return 1;
+    if (!vae->dev && !dv_load(vae)) return 0;
+    return dv_ensure(vae, h, w);
+}
+
+void iris_vae_release_qimage(iris_vae_qimage_t *vae) {
+    if (vae->dev) dv_free_buffers(vae->dev);
+}
+
 static iris_image *decode_dev(iris_vae_qimage_t *vae, const float *latent, int h, int w) {
-    if (!vae->dev && !dv_load(vae)) return NULL;
-    if (!dv_ensure(vae, h, w)) return NULL;
+    if (!iris_vae_reserve_qimage(vae, h, w)) return NULL;
     struct qv_dev *d = vae->dev;
     float *x = d->buf[0], *y = d->buf[1], *t1 = d->buf[2], *t2 = d->buf[3], *tmp;
 #define DV_SWAP() (tmp = x, x = y, y = tmp)
@@ -543,6 +552,15 @@ static iris_image *decode_dev(iris_vae_qimage_t *vae, const float *latent, int h
     free(hwc);
     free(rgba);
     return img;
+}
+#else
+int iris_vae_reserve_qimage(iris_vae_qimage_t *vae, int h, int w) {
+    (void)vae, (void)h, (void)w;
+    return 1;
+}
+
+void iris_vae_release_qimage(iris_vae_qimage_t *vae) {
+    (void)vae;
 }
 #endif /* IRIS_DEV */
 
