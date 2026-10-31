@@ -431,13 +431,6 @@ static void text_norm(const iris_transformer_qimage_t *tf, float *n, const float
     }
 }
 
-static void gelu_tanh(float *x, size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        float u = x[i];
-        x[i] = 0.5f * u * (1.0f + tanhf(0.7978845608028654f * (u + 0.044715f * u * u * u)));
-    }
-}
-
 /* Text input projection: zero-centered RMSNorm, linear, GELU-tanh, linear. */
 static void text_in(iris_transformer_qimage_t *tf, float *x, const float *txt, int txt_seq) {
     int dim = tf->dim, td = tf->text_dim;
@@ -445,7 +438,7 @@ static void text_in(iris_transformer_qimage_t *tf, float *x, const float *txt, i
     float *hid = malloc((size_t)txt_seq * dim * sizeof(float));
     text_norm(tf, n, txt, txt_seq);
     linear_bf16(tf, hid, n, tf->txt_in1, txt_seq, td, dim);
-    gelu_tanh(hid, (size_t)txt_seq * dim);
+    iris_gelu_tanh(hid, (size_t)txt_seq * dim);
     linear_bf16(tf, x, hid, tf->txt_in2, txt_seq, dim, dim);
     free(hid);
     free(n);
@@ -772,7 +765,7 @@ static int dev_prefill(iris_transformer_qimage_t *tf, const float *txt, int L) {
     text_norm(tf, host, txt, L);
     dev_input_linear(tf, d->out, host, L, tf->text_dim, d->txt_in1, dim);
     iris_dev_download(host, d->out, (size_t)L * dim * sizeof(float));
-    gelu_tanh(host, (size_t)L * dim);
+    iris_gelu_tanh(host, (size_t)L * dim);
     dev_input_linear(tf, d->x, host, L, dim, d->txt_in2, dim);
     free(host);
 

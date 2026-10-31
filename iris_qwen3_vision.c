@@ -66,7 +66,7 @@ struct qwen3_vision {
     int deep_index[QWEN3_VISION_DEEPSTACK];
 
     float *patch_w, *patch_b;           /* [dim, VIS_CHANNELS * patch^2], temporal slices summed */
-    const uint16_t *pos;                /* [side^2, dim] */
+    float *pos;                         /* [side^2, dim] */
     vis_block_t *blocks;
     vis_merger_t merger, deep[QWEN3_VISION_DEEPSTACK];
 
@@ -86,13 +86,6 @@ typedef struct {
 /* ========================================================================
  * Image Input
  * ======================================================================== */
-
-static float bf16_value(uint16_t v) {
-    uint32_t bits = (uint32_t)v << 16;
-    float f;
-    memcpy(&f, &bits, sizeof(f));
-    return f;
-}
 
 /* Row and column of patch p in the block-major order. */
 static void patch_position(const qwen3_vision_t *v, int p, int gw, int *row, int *col) {
@@ -124,8 +117,8 @@ static void position_embed(const qwen3_vision_t *v, float *out, int n, int gh, i
         for (int a = 0; a < 2; a++) {
             for (int b = 0; b < 2; b++) {
                 float weight = (a ? fh : 1.0f - fh) * (b ? fw : 1.0f - fw);
-                const uint16_t *t = v->pos + (size_t)(h[a] * v->side + w[b]) * dim;
-                for (int d = 0; d < dim; d++) o[d] += weight * bf16_value(t[d]);
+                const float *t = v->pos + (size_t)(h[a] * v->side + w[b]) * dim;
+                for (int d = 0; d < dim; d++) o[d] += weight * t[d];
             }
         }
     }
@@ -305,13 +298,6 @@ static int attention(float *out, const float *qkv, int n, int heads, int head_di
     return 1;
 }
 
-static void gelu_tanh(float *x, size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        float u = x[i];
-        x[i] = 0.5f * u * (1.0f + tanhf(0.7978845608028654f * (u + 0.044715f * u * u * u)));
-    }
-}
-
 static void gelu_exact(float *x, size_t n) {
     for (size_t i = 0; i < n; i++)
         x[i] = 0.5f * x[i] * (1.0f + erff(x[i] * 0.70710678118654752f));
@@ -342,7 +328,7 @@ static int block_forward(const qwen3_vision_t *v, const vis_block_t *b, vis_work
 
     layer_norm(w->norm, w->x, &b->norm2, n);
     linear(w->wide, w->norm, &b->fc1, n);
-    gelu_tanh(w->wide, (size_t)n * v->mlp);
+    iris_gelu_tanh(w->wide, (size_t)n * v->mlp);
     linear(w->a, w->wide, &b->fc2, n);
     add(w->x, w->a, (size_t)n * dim);
     return 1;
@@ -620,12 +606,18 @@ static const safetensor_t *find_tensor(const qwen3_vision_t *v, const char *name
     return NULL;
 }
 
-static float *get_f32(const qwen3_vision_t *v, const char *prefix, const char *suffix) {
+/* The tensor as new f32 data, if it has n elements. */
+static float *get_f32(const qwen3_vision_t *v, const char *prefix, const char *suffix, int64_t n) {
     char name[256];
     snprintf(name, sizeof(name), "%s.%s", prefix, suffix);
     safetensors_file_t *sf;
     const safetensor_t *t = find_tensor(v, name, &sf);
-    return t ? safetensors_get_f32(sf, t) : NULL;
+    if (!t) return NULL;
+    if (safetensor_numel(t) != n) {
+        fprintf(stderr, "Qwen3 vision: %s must have %lld elements\n", name, (long long)n);
+        return NULL;
+    }
+    return safetensors_get_f32(sf, t);
 }
 
 /* The mmapped bf16 tensor, if it has n elements. */
@@ -645,15 +637,15 @@ static int load_linear(const qwen3_vision_t *v, vis_linear_t *l, const char *pre
     char name[256];
     snprintf(name, sizeof(name), "%s.weight", prefix);
     l->w = get_bf16(v, name, (int64_t)in * out);
-    l->b = get_f32(v, prefix, "bias");
+    l->b = get_f32(v, prefix, "bias", out);
     l->in = in;
     l->out = out;
     return l->w && l->b;
 }
 
 static int load_norm(const qwen3_vision_t *v, vis_norm_t *n, const char *prefix, int dim) {
-    n->w = get_f32(v, prefix, "weight");
-    n->b = get_f32(v, prefix, "bias");
+    n->w = get_f32(v, prefix, "weight", dim);
+    n->b = get_f32(v, prefix, "bias", dim);
     n->dim = dim;
     return n->w && n->b;
 }
@@ -693,22 +685,21 @@ static int load_merger(const qwen3_vision_t *v, vis_merger_t *m, const char *pre
  * of an image are identical. */
 static int load_patch_embed(qwen3_vision_t *v) {
     const char *prefix = "model.visual.patch_embed.proj";
-    char name[128];
     int dim = v->dim, area = v->patch * v->patch, t = v->temporal;
     size_t row_len = (size_t)VIS_CHANNELS * area;
-    snprintf(name, sizeof(name), "%s.weight", prefix);
-    const uint16_t *w = get_bf16(v, name, (int64_t)dim * VIS_CHANNELS * t * area);
-    v->patch_b = get_f32(v, prefix, "bias");
+    float *w = get_f32(v, prefix, "weight", (int64_t)dim * VIS_CHANNELS * t * area);
+    v->patch_b = get_f32(v, prefix, "bias", dim);
     v->patch_w = calloc(dim * row_len, sizeof(float));
-    if (!w || !v->patch_b || !v->patch_w) return 0;
-    for (int o = 0; o < dim; o++)
+    int ok = w && v->patch_b && v->patch_w;
+    for (int o = 0; ok && o < dim; o++)
         for (int c = 0; c < VIS_CHANNELS; c++)
             for (int f = 0; f < t; f++) {
-                const uint16_t *src = w + ((size_t)o * VIS_CHANNELS * t + c * t + f) * area;
+                const float *src = w + ((size_t)o * VIS_CHANNELS * t + c * t + f) * area;
                 float *dst = v->patch_w + (o * (size_t)VIS_CHANNELS + c) * area;
-                for (int i = 0; i < area; i++) dst[i] += bf16_value(src[i]);
+                for (int i = 0; i < area; i++) dst[i] += src[i];
             }
-    return 1;
+    free(w);
+    return ok;
 }
 
 /* A positive integer of the vision_config object. */
@@ -805,6 +796,7 @@ void qwen3_vision_free(qwen3_vision_t *v) {
     for (int k = 0; k < QWEN3_VISION_DEEPSTACK; k++) free_merger(&v->deep[k]);
     free(v->patch_w);
     free(v->patch_b);
+    free(v->pos);
     for (int f = 0; f < v->num_sf; f++) safetensors_close(v->sf[f]);
     free(v);
 }
@@ -821,7 +813,7 @@ qwen3_vision_t *qwen3_vision_load(const char *text_encoder_dir) {
     ok = ok && load_patch_embed(v);
     if (ok) {
         int table = v->side * v->side, merged = v->dim * v->merge * v->merge;
-        v->pos = get_bf16(v, "model.visual.pos_embed.weight", (int64_t)table * v->dim);
+        v->pos = get_f32(v, "model.visual.pos_embed", "weight", (int64_t)table * v->dim);
         ok = v->pos != NULL;
         for (int l = 0; ok && l < v->depth; l++) ok = load_block(v, &v->blocks[l], l);
         ok = ok && load_merger(v, &v->merger, "model.visual.merger", v->dim);
