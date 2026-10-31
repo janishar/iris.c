@@ -3112,6 +3112,9 @@ static id<MTLComputePipelineState> g_softmax_pipeline = nil;
 static id<MTLComputePipelineState> g_rope_2d_pipeline = nil;
 static id<MTLComputePipelineState> g_rope_unified_pipeline = nil;
 static id<MTLComputePipelineState> g_causal_attention_pipeline = nil;
+/* The same limit as iris_shaders.metal, which sizes its threadgroup scores by it */
+#define CAUSAL_ATTENTION_MAX_SEQ 1280
+
 static id<MTLComputePipelineState> g_causal_attention_bf16_pipeline = nil;
 static id<MTLComputePipelineState> g_rope_bf16_pipeline = nil;
 static id<MTLComputePipelineState> g_head_rms_norm_bf16_pipeline = nil;
@@ -5520,8 +5523,8 @@ int iris_gpu_causal_attention_bf16(iris_gpu_tensor_t out,
     if (!out || !Q || !K || !V) return 0;
     if (!out->is_f16 || !Q->is_f16 || !K->is_f16 || !V->is_f16) return 0;
 
-    /* Limit seq length to what the shader can handle (512 for shared memory) */
-    if (seq > 512) {
+    /* Limit seq length to what the shader can handle (its shared memory) */
+    if (seq > CAUSAL_ATTENTION_MAX_SEQ) {
         return 0;
     }
 
@@ -6230,8 +6233,8 @@ int iris_metal_causal_attention(float *out,
         return 0;  /* Shader not available, fall back to CPU */
     }
 
-    /* Limit seq length to what the shader can handle (512 for shared memory) */
-    if (seq > 512) {
+    /* Limit seq length to what the shader can handle (its shared memory) */
+    if (seq > CAUSAL_ATTENTION_MAX_SEQ) {
         return 0;  /* Fall back to CPU for long sequences */
     }
 

@@ -1133,7 +1133,7 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
 #endif
 #ifdef USE_METAL
     /* Try fully GPU-resident path: 1 sync instead of 72, skips unneeded layers */
-    if (model->use_bf16 && iris_metal_available() && seq_len <= 512) {
+    if (model->use_bf16 && iris_metal_available()) {
         if (qwen3_forward_gpu(model, seq_len, attention_mask))
             goto concatenate;
         /* GPU path failed, fall through to mixed CPU/GPU path.
