@@ -1696,8 +1696,8 @@ static void qwen3_set_defaults(qwen3_model_t *model) {
 
 /* Open all safetensors shards dynamically by reading model.safetensors.index.json.
  * Returns number of files opened, 0 on failure. */
-static int open_safetensors_shards(const char *model_dir,
-                                    safetensors_file_t **files, int max_files) {
+int open_safetensors_shards(const char *model_dir,
+                            safetensors_file_t **files, int max_files) {
     char path[1024];
 
     /* First try: read the index JSON to discover shard filenames */

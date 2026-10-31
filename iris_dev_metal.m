@@ -44,10 +44,11 @@ static uint16_t *g_conv_scratch = NULL;
 static float *g_gn_scratch = NULL;
 static size_t g_gn_scratch_size = 0;
 
-static id<MTLComputePipelineState> p_f32_to_bf16, p_silu, p_add, p_add_bias, p_swiglu,
+static id<MTLComputePipelineState> p_f32_to_bf16, p_silu, p_gelu_tanh, p_add, p_add_bias, p_swiglu,
     p_residual, p_fill_rows, p_layer_norm_mod, p_rms_norm, p_rms_norm_residual, p_key_mask_bias,
-    p_head_norm_rope, p_copy_2d, p_im2col,
-    p_gn_partial, p_gn_finalize, p_gn_apply, p_upsample2x, p_pixel_rms_norm, p_dup_up_add, p_avg_down_add;
+    p_head_norm_rope, p_rope, p_copy_2d, p_im2col,
+    p_gn_partial, p_gn_finalize, p_gn_apply, p_upsample2x, p_pixel_rms_norm, p_dup_up_add,
+    p_avg_down_add;
 
 /* ========================================================================
  * Kernels
@@ -84,6 +85,12 @@ kernel void f32_to_bf16(device ushort *dst, device const float *src, constant ul
 
 kernel void silu(device float *x, constant ulong &n, uint i [[thread_position_in_grid]]) {
     if (i < n) x[i] = x[i] / (1.0f + exp(-x[i]));
+}
+
+kernel void gelu_tanh(device float *x, constant ulong &n, uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    float u = x[i];
+    x[i] = 0.5f * u * (1.0f + precise::tanh(0.7978845608028654f * (u + 0.044715f * u * u * u)));
 }
 
 kernel void add(device float *x, device const float *a, constant ulong &n,
@@ -198,6 +205,20 @@ kernel void head_norm_rope(device ushort *x, device const float *w, device const
     float c = rc[(ulong)tg.x * half_dim + i], s = rs[(ulong)tg.x * half_dim + i];
     v[i0] = f2bf(a * c - b * s);
     v[i1] = f2bf(b * c + a * s);
+}
+
+kernel void rope(device ushort *x, device const float *rc, device const float *rs,
+                 constant int &ld, constant int &heads, constant int &head_dim,
+                 constant ulong &n, uint e [[thread_position_in_grid]]) {
+    if (e >= n) return;
+    int half_dim = head_dim / 2;
+    ulong s = e / (ulong)(heads * half_dim);
+    int rest = int(e % (ulong)(heads * half_dim)), i = rest % half_dim;
+    device ushort *v = x + s * ld + (ulong)(rest / half_dim) * head_dim;
+    float a = bf2f(v[i]), b = bf2f(v[i + half_dim]);
+    float c = rc[s * half_dim + i], sn = rs[s * half_dim + i];
+    v[i] = f2bf(a * c - b * sn);
+    v[i + half_dim] = f2bf(b * c + a * sn);
 }
 
 /* dst[r * ldd + c] = src[r * lds + c] (bf16) */
@@ -346,6 +367,7 @@ int iris_dev_init(void) {
         }
         p_f32_to_bf16 = pipeline(lib, @"f32_to_bf16");
         p_silu = pipeline(lib, @"silu");
+        p_gelu_tanh = pipeline(lib, @"gelu_tanh");
         p_add = pipeline(lib, @"add");
         p_add_bias = pipeline(lib, @"add_bias");
         p_swiglu = pipeline(lib, @"swiglu");
@@ -356,6 +378,7 @@ int iris_dev_init(void) {
         p_rms_norm_residual = pipeline(lib, @"rms_norm_residual");
         p_key_mask_bias = pipeline(lib, @"key_mask_bias");
         p_head_norm_rope = pipeline(lib, @"head_norm_rope");
+        p_rope = pipeline(lib, @"rope");
         p_copy_2d = pipeline(lib, @"copy_2d");
         p_im2col = pipeline(lib, @"im2col");
         p_gn_partial = pipeline(lib, @"gn_partial");
@@ -365,9 +388,9 @@ int iris_dev_init(void) {
         p_pixel_rms_norm = pipeline(lib, @"pixel_rms_norm");
         p_dup_up_add = pipeline(lib, @"dup_up_add");
         p_avg_down_add = pipeline(lib, @"avg_down_add");
-        if (!p_f32_to_bf16 || !p_silu || !p_add || !p_add_bias || !p_swiglu || !p_residual ||
+        if (!p_f32_to_bf16 || !p_silu || !p_gelu_tanh || !p_add || !p_add_bias || !p_swiglu || !p_residual ||
             !p_fill_rows || !p_layer_norm_mod || !p_rms_norm || !p_rms_norm_residual ||
-            !p_key_mask_bias || !p_head_norm_rope || !p_copy_2d || !p_im2col ||
+            !p_key_mask_bias || !p_head_norm_rope || !p_rope || !p_copy_2d || !p_im2col ||
             !p_gn_partial || !p_gn_finalize || !p_gn_apply || !p_upsample2x ||
             !p_pixel_rms_norm || !p_dup_up_add || !p_avg_down_add)
             return 0;
@@ -548,6 +571,16 @@ void iris_dev_silu(float *x, size_t n) {
     }
 }
 
+void iris_dev_gelu_tanh(float *x, size_t n) {
+    if (!n) return;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> e = begin(p_gelu_tanh);
+        arg_ptr(e, x, 0);
+        arg_ulong(e, n, 1);
+        end_elementwise(e, n);
+    }
+}
+
 void iris_dev_add(float *x, const float *a, size_t n) {
     if (!n) return;
     @autoreleasepool {
@@ -688,6 +721,23 @@ void iris_dev_head_norm_rope(uint16_t *x, int ld, const float *w, const float *r
         [e dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
           threadsPerThreadgroup:MTLSizeMake(head_dim / 2, 1, 1)];
         [e endEncoding];
+    }
+}
+
+void iris_dev_rope(uint16_t *x, int ld, const float *rope_cos, const float *rope_sin, int seq,
+                   int heads, int head_dim) {
+    size_t n = (size_t)seq * heads * (head_dim / 2);
+    if (!n) return;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> e = begin(p_rope);
+        arg_ptr(e, x, 0);
+        arg_ptr(e, rope_cos, 1);
+        arg_ptr(e, rope_sin, 2);
+        arg_int(e, ld, 3);
+        arg_int(e, heads, 4);
+        arg_int(e, head_dim, 5);
+        arg_ulong(e, n, 6);
+        end_elementwise(e, n);
     }
 }
 

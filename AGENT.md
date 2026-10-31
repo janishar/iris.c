@@ -67,6 +67,7 @@ iris_vae_qimage.c         - Qwen-Image 2.1 VAE (Wan-derived, 2D)
 iris_qimage.h             - Qwen-Image internal API (scheduler, transformer, VAE)
 iris_sample.c             - Sampling/denoising loops (Euler ODE)
 iris_qwen3.c              - Qwen3 text encoder
+iris_qwen3_vision.c       - Qwen3-VL vision tower (Qwen-Image references)
 iris_qwen3_tokenizer.c    - BPE tokenizer
 iris_vae.c                - VAE encoder/decoder
 iris_kernels.c            - CPU kernels (softmax, RMSNorm, etc.)
@@ -516,6 +517,21 @@ theta 10000 (hardcoded upstream), eps 1e-6, causal_condition=true. No biases.
 - Tokenizer may live in `processor/`; Turbo's encoder may be one
   `model.safetensors`.
 
+# Qwen3-VL Vision Tower
+
+`qwen3_vision_encode()`, one image at a time (config in `text_encoder/config.json`):
+- Patches are block-major (block row, block column, row and column in block),
+  so merged rows are raster and each 2x2 block is contiguous.
+- Patch embedding: the Conv3d's temporal slices summed into one linear.
+  Position embedding: bilinear on the 48x48 table, align_corners.
+- 27 pre-norm blocks: `qkv` with bias, split-half RoPE (pairs (i, i + 36)) on Q
+  and K, no head norm, GELU-tanh MLP. Mergers use exact GELU; deepstack mergers
+  (after blocks 8, 16, 24) norm after flattening, the main one before.
+- The stream grows to rms 162, max 14000 in the last blocks, which amplifies
+  rounding: at 512x512 / 1024x1024, upstream f32 vs f64 is 2.4e-5 / 7.5e-5 on the
+  output, upstream bf16 vs f32 5% / 16%, iris on Metal 3% / 6% (input rounding,
+  not attention: f32 attention on the host still gives 5.4%).
+
 # Qwen-Image Known Pitfalls
 
 1. **Turbo sigmas go through the scheduler too**: the pipeline passes
@@ -547,6 +563,8 @@ theta 10000 (hardcoded upstream), eps 1e-6, causal_condition=true. No biases.
   device with iris_dev_upload()/iris_dev_upload_2d().
 - iris_dev_copy_2d(): stream-ordered device-to-device bf16 copy (Qwen-Image
   copies each block's cached text K|V into the shared QKV buffer with it).
+- iris_dev_rope(): split-half rotation without norm, any head_dim (the vision
+  tower: head_dim 72, attention takes the GEMM path on CUDA).
 - Attention: flash kernels for head_dim 128, non-causal, optional key mask
   (CUDA: mma.sync + cp.async + ldmatrix; ROCm: gfx11 WMMA, computing transposed
   products so each lane owns a query). Other cases use batched GEMMs around a
@@ -572,6 +590,8 @@ Known pitfalls:
    two. The VAE encodes dozens of shapes, which aborted at small sizes (large
    ones hid it, MPSGraph commits by itself under load): run_graph flushes after
    CMD_MAX_GRAPHS distinct graphs.
+5. Plain Metal tanh() returns NaN for large arguments (fast-math): use
+   precise::tanh().
 
 # Test Commands
 
