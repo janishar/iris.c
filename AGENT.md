@@ -501,9 +501,10 @@ theta 10000 (hardcoded upstream), eps 1e-6, causal_condition=true. No biases.
   first encode and freed by iris_vae_release_qimage(); the latent is the
   normalized posterior mean.
 - Reference preparation (iris_image.c): RGBA, 32-px grid with Python's round,
-  premultiplied Lanczos, vision copy over white. iris_image_resize keeps floats
-  between its passes where PIL rounds to 8 bits, so expect RMS 0.3-0.4/255 on
-  opaque images and more at very low alpha, where unpremultiplying amplifies it.
+  premultiplied Lanczos, vision copy over white. The resize is PIL's 8-bit one
+  (fixed-point weights, rounded and clipped after each pass), not
+  iris_image_resize, whose float passes FLUX.3 relies on: the encoder turns the
+  difference of up to 6/255 RMS into 1-7% of latent error.
 
 # Qwen-Image Text Encoder
 

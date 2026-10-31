@@ -754,11 +754,14 @@ static float *encode_dev(const iris_vae_qimage_t *vae, const float *rgba, int h,
     int moments = n->quant.cout, zc = vae->z_dim;
     float *out = malloc((size_t)zc * hw * sizeof(float));
     hwc = malloc((size_t)moments * hw * sizeof(float));
-    if (out && hwc) {
-        iris_dev_download(hwc, x, (size_t)moments * hw * sizeof(float));
-        for (int c = 0; c < zc; c++)
-            for (size_t p = 0; p < hw; p++) out[c * hw + p] = hwc[p * moments + c];
+    if (!out || !hwc) {
+        free(out);
+        free(hwc);
+        return NULL;
     }
+    iris_dev_download(hwc, x, (size_t)moments * hw * sizeof(float));
+    for (int c = 0; c < zc; c++)
+        for (size_t p = 0; p < hw; p++) out[c * hw + p] = hwc[p * moments + c];
     free(hwc);
     return out;
 }
