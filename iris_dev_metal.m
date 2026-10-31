@@ -23,6 +23,9 @@
 #define ROW_THREADS 256
 #define CONV_SCRATCH ((size_t)256 << 20)   /* im2col buffer budget (bytes) */
 #define GN_BLOCKS 64
+/* A command buffer holds 32 residency sets and a graph takes about two of
+ * them (measured: 24 graphs overflow, 16 fit). */
+#define CMD_MAX_GRAPHS 12
 
 static int g_ready = 0;
 static char g_name[256] = "none";
@@ -32,6 +35,7 @@ static id<MTLCommandBuffer> g_cmd;              /* open command buffer, or nil *
 static NSMutableArray<id<MTLBuffer>> *g_buffers; /* sorted by contents address */
 static id<MTLBuffer> g_dummy;                   /* bound for NULL arguments */
 static NSMutableDictionary *g_graphs;           /* MPSGraph cache by shape key */
+static NSMutableSet *g_cmd_graphs;              /* graphs in the open command buffer */
 
 /* Scratch for attention (contiguous q, k, v, out), convolution, GroupNorm. */
 static uint16_t *g_attn_scratch = NULL;
@@ -43,7 +47,7 @@ static size_t g_gn_scratch_size = 0;
 static id<MTLComputePipelineState> p_f32_to_bf16, p_silu, p_add, p_add_bias, p_swiglu,
     p_residual, p_fill_rows, p_layer_norm_mod, p_rms_norm, p_rms_norm_residual, p_key_mask_bias,
     p_head_norm_rope, p_copy_2d, p_im2col,
-    p_gn_partial, p_gn_finalize, p_gn_apply, p_upsample2x;
+    p_gn_partial, p_gn_finalize, p_gn_apply, p_upsample2x, p_pixel_rms_norm, p_dup_up_add;
 
 /* ========================================================================
  * Kernels
@@ -269,6 +273,33 @@ kernel void upsample2x(device float *out, device const float *in, constant int &
     int x = int(p % (2 * w)), y = int(p / (2 * w));
     out[i] = in[((ulong)(y / 2) * w + x / 2) * c + ch];
 }
+
+kernel void pixel_rms_norm(device float *out, device const float *in, device const float *gamma,
+                           constant int &c, constant int &silu_act, constant int &hw,
+                           uint p [[thread_position_in_grid]]) {
+    if (int(p) >= hw) return;
+    device const float *x = in + (ulong)p * c;
+    device float *o = out + (ulong)p * c;
+    float s = 0;
+    for (int i = 0; i < c; i++) s += x[i] * x[i];
+    float inv = sqrt(float(c)) / max(sqrt(s), 1e-12f);
+    for (int i = 0; i < c; i++) {
+        float v = x[i] * inv * gamma[i];
+        o[i] = silu_act ? v / (1.0f + exp(-v)) : v;
+    }
+}
+
+kernel void dup_up_add(device float *out, device const float *in, constant int &w,
+                       constant int &cin, constant int &cout, constant int &ft,
+                       constant int &repeats, constant ulong &n,
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    int o = int(i % cout);
+    ulong p = i / cout;
+    int x2 = int(p % (2 * w)), y2 = int(p / (2 * w));
+    int src = (((o * ft + ft - 1) * 2 + (y2 & 1)) * 2 + (x2 & 1)) / repeats;
+    out[i] += in[((ulong)(y2 / 2) * w + x2 / 2) * cin + src];
+}
 )MSL";
 
 /* ========================================================================
@@ -314,13 +345,17 @@ int iris_dev_init(void) {
         p_gn_finalize = pipeline(lib, @"gn_finalize");
         p_gn_apply = pipeline(lib, @"gn_apply");
         p_upsample2x = pipeline(lib, @"upsample2x");
+        p_pixel_rms_norm = pipeline(lib, @"pixel_rms_norm");
+        p_dup_up_add = pipeline(lib, @"dup_up_add");
         if (!p_f32_to_bf16 || !p_silu || !p_add || !p_add_bias || !p_swiglu || !p_residual ||
             !p_fill_rows || !p_layer_norm_mod || !p_rms_norm || !p_rms_norm_residual ||
             !p_key_mask_bias || !p_head_norm_rope || !p_copy_2d || !p_im2col ||
-            !p_gn_partial || !p_gn_finalize || !p_gn_apply || !p_upsample2x)
+            !p_gn_partial || !p_gn_finalize || !p_gn_apply || !p_upsample2x ||
+            !p_pixel_rms_norm || !p_dup_up_add)
             return 0;
         g_buffers = [NSMutableArray array];
         g_graphs = [NSMutableDictionary dictionary];
+        g_cmd_graphs = [NSMutableSet set];
         g_dummy = [g_device newBufferWithLength:16 options:MTLResourceStorageModeShared];
         snprintf(g_name, sizeof(g_name), "%s", g_device.name.UTF8String);
     }
@@ -333,6 +368,7 @@ const char *iris_dev_name(void) { return g_name; }
 
 /* Commit the open command buffer and wait for it. */
 static void flush(void) {
+    [g_cmd_graphs removeAllObjects];
     if (!g_cmd) return;
     [g_cmd commit];
     [g_cmd waitUntilCompleted];
@@ -362,6 +398,7 @@ void iris_dev_cleanup(void) {
     g_gn_scratch = NULL;
     g_attn_scratch_elems = g_gn_scratch_size = 0;
     g_graphs = nil;
+    g_cmd_graphs = nil;
     g_buffers = nil;
     g_ready = 0;
 }
@@ -680,6 +717,10 @@ static MPSGraphTensorData *tensor_data(const void *p, NSArray<NSNumber *> *shape
 }
 
 static void run_graph(IrisDevGraph *g, NSArray *ptrs, void *out) {
+    if (![g_cmd_graphs containsObject:g]) {
+        if (g_cmd_graphs.count >= CMD_MAX_GRAPHS) flush();
+        [g_cmd_graphs addObject:g];
+    }
     NSMutableDictionary *feeds = [NSMutableDictionary dictionary];
     for (NSUInteger i = 0; i < g.inputs.count; i++)
         feeds[g.inputs[i]] = tensor_data([ptrs[i] pointerValue], g.shapes[i], MPSDataTypeBFloat16);
@@ -931,6 +972,39 @@ void iris_dev_upsample2x(float *out, const float *in, int h, int width, int c) {
         arg_int(e, width, 2);
         arg_int(e, c, 3);
         arg_ulong(e, n, 4);
+        end_elementwise(e, n);
+    }
+}
+
+void iris_dev_pixel_rms_norm(float *out, const float *in, const float *gamma, int hw, int c,
+                             int silu) {
+    if (!hw) return;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> e = begin(p_pixel_rms_norm);
+        arg_ptr(e, out, 0);
+        arg_ptr(e, in, 1);
+        arg_ptr(e, gamma, 2);
+        arg_int(e, c, 3);
+        arg_int(e, silu, 4);
+        arg_int(e, hw, 5);
+        end_elementwise(e, hw);
+    }
+}
+
+void iris_dev_dup_up_add(float *out, const float *in, int h, int width, int cin, int cout,
+                         int ft) {
+    size_t n = (size_t)4 * h * width * cout;
+    if (!n) return;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> e = begin(p_dup_up_add);
+        arg_ptr(e, out, 0);
+        arg_ptr(e, in, 1);
+        arg_int(e, width, 2);
+        arg_int(e, cin, 3);
+        arg_int(e, cout, 4);
+        arg_int(e, ft, 5);
+        arg_int(e, cout * ft * 4 / cin, 6);
+        arg_ulong(e, n, 7);
         end_elementwise(e, n);
     }
 }

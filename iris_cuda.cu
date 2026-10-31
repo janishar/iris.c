@@ -1097,3 +1097,43 @@ extern "C" void iris_dev_upsample2x(float *out, const float *in, int h, int widt
     size_t n = (size_t)4 * h * width * c;
     if (n) k_upsample2x<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(out, in, h, width, c, n);
 }
+
+__global__ void k_pixel_rms_norm(float *out, const float *in, const float *gamma, int c,
+                                 int silu, int hw) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= hw) return;
+    const float *x = in + (size_t)p * c;
+    float *o = out + (size_t)p * c;
+    float s = 0;
+    for (int i = 0; i < c; i++) s += x[i] * x[i];
+    float norm = sqrtf(s);
+    float inv = sqrtf((float)c) / (norm > 1e-12f ? norm : 1e-12f);
+    for (int i = 0; i < c; i++) {
+        float v = x[i] * inv * gamma[i];
+        o[i] = silu ? v / (1.0f + expf(-v)) : v;
+    }
+}
+
+extern "C" void iris_dev_pixel_rms_norm(float *out, const float *in, const float *gamma,
+                                        int hw, int c, int silu) {
+    if (hw) k_pixel_rms_norm<<<ew_blocks(hw), EW_THREADS, 0, g_stream>>>(out, in, gamma, c,
+                                                                         silu, hw);
+}
+
+__global__ void k_dup_up_add(float *out, const float *in, int w, int cin, int cout, int ft,
+                             int repeats, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int o = (int)(i % cout);
+    size_t p = i / cout;
+    int x2 = (int)(p % (2 * w)), y2 = (int)(p / (2 * w));
+    int src = (((o * ft + ft - 1) * 2 + (y2 & 1)) * 2 + (x2 & 1)) / repeats;
+    out[i] += in[((size_t)(y2 / 2) * w + x2 / 2) * cin + src];
+}
+
+extern "C" void iris_dev_dup_up_add(float *out, const float *in, int h, int width, int cin,
+                                    int cout, int ft) {
+    size_t n = (size_t)4 * h * width * cout;
+    if (n) k_dup_up_add<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(out, in, width, cin, cout, ft,
+                                                                   cout * ft * 4 / cin, n);
+}

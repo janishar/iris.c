@@ -130,6 +130,17 @@ void iris_dev_group_norm(float *out, const float *in, const float *gamma, const 
 /* Nearest-neighbor 2x upsampling of [h * w, c] into [2h * 2w, c]. */
 void iris_dev_upsample2x(float *out, const float *in, int h, int width, int c);
 
+/* out = in / max(||in||, 1e-12) * sqrt(c) * gamma over the channels of each
+ * of the hw pixels, optionally followed by SiLU. out may be in. */
+void iris_dev_pixel_rms_norm(float *out, const float *in, const float *gamma,
+                             int hw, int c, int silu);
+
+/* Channel-to-space shortcut, added to out [2h * 2w, cout]:
+ *   out[(2y + i, 2x + j), o] += in[(y, x), (((o * ft + ft - 1) * 2 + i) * 2 + j) / repeats]
+ * with repeats = cout * ft * 4 / cin. */
+void iris_dev_dup_up_add(float *out, const float *in, int h, int width, int cin, int cout,
+                         int ft);
+
 #ifdef __cplusplus
 }
 #endif

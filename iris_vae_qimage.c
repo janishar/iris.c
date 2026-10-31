@@ -19,8 +19,8 @@
  * (1x1 when the channel count changes) + conv2(silu(norm2(conv1(silu(
  * norm1(x)))))). The mid attention is single-head over all latent pixels.
  *
- * Activations are f32 NCHW [C, H, W]. Weights are converted to f32 at
- * load (the checkpoint may be f32 or bf16).
+ * Activations are f32 NCHW [C, H, W], channels-last on the GPU. Weights are
+ * converted to f32 at load (the checkpoint may be f32 or bf16).
  */
 
 #include "iris.h"
@@ -38,6 +38,10 @@
 #else
 #include <cblas.h>
 #endif
+#endif
+
+#ifdef IRIS_DEV
+#include "iris_dev.h"
 #endif
 
 #define QV_MAX_CH      512   /* latent channels / config array bound */
@@ -83,6 +87,9 @@ struct iris_vae_qimage {
     int num_up;
     qv_up_t up[QV_MAX_LEVELS];
     float *norm_out;         /* [C] */
+#ifdef IRIS_DEV
+    struct qv_dev *dev;      /* device copy, uploaded at the first decode */
+#endif
 };
 
 /* ========================================================================
@@ -242,12 +249,316 @@ static float *up_forward(const qv_up_t *u, float *x, int *h, int *w) {
     return out;
 }
 
+/* [channels, h, w] floats in [-1, 1] to an image: clamp, then round(v * 255)
+ * like diffusers, dropping the alpha channel of a fully opaque image. */
+static iris_image *rgba_to_image(const float *rgba, int channels, int h, int w) {
+    size_t npix = (size_t)h * w;
+    iris_image *img = iris_image_create(w, h, channels);
+    if (!img) return NULL;
+    int opaque = channels == 4;
+    for (size_t p = 0; p < npix; p++) {
+        for (int ch = 0; ch < channels; ch++) {
+            float v = rgba[ch * npix + p];
+            v = v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);
+            img->data[p * channels + ch] = (uint8_t)((v + 1.0f) * 127.5f + 0.5f);
+        }
+        if (opaque && img->data[p * channels + 3] != 255) opaque = 0;
+    }
+    if (opaque) {
+        for (size_t p = 0; p < npix; p++)
+            memmove(img->data + p * 3, img->data + p * 4, 3);
+        img->channels = 3;
+    }
+    return img;
+}
+
+#ifdef IRIS_DEV
+/* ========================================================================
+ * GPU Path (CUDA / ROCm / Metal)
+ * ======================================================================== */
+
+typedef struct {
+    uint16_t *w;             /* bf16 [cout, k * k * cin] */
+    float *b;                /* [cout] */
+} qd_conv_t;
+
+typedef struct {
+    float *gamma1, *gamma2;
+    qd_conv_t conv1, conv2, shortcut;
+} qd_res_t;
+
+struct qv_dev {
+    qd_conv_t post_quant, conv_in, conv_out, attn_qkv, attn_proj;
+    qd_res_t mid_res[2];
+    qd_res_t res[QV_MAX_LEVELS][QV_MAX_RES];
+    qd_conv_t up_conv[QV_MAX_LEVELS];
+    float *attn_gamma, *norm_out;
+
+    /* Activations, sized by dv_ensure() */
+    float *buf[4];           /* x, y, t1, t2 */
+    float *skip;             /* input of an upsampling block */
+    uint16_t *attn;          /* q, k, v, out */
+    size_t buf_elems, skip_elems, attn_elems;
+};
+
+static uint16_t f32_to_bf16(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    u += 0x7FFF + ((u >> 16) & 1);
+    return (uint16_t)(u >> 16);
+}
+
+static float *dv_f32(const float *src, size_t n) {
+    float *d = iris_dev_alloc(n * sizeof(float));
+    if (d) iris_dev_upload(d, src, n * sizeof(float));
+    return d;
+}
+
+/* Upload a convolution: weight [cout, cin, k, k] to the channels-last
+ * layout of iris_dev_conv2d. A missing convolution stays NULL. */
+static int dv_conv(qd_conv_t *d, const qv_conv_t *c) {
+    if (!c->w) return 1;
+    int kk = c->k * c->k;
+    size_t row = (size_t)kk * c->cin, n = row * c->cout;
+    uint16_t *tmp = malloc(n * sizeof(uint16_t));
+    if (!tmp) return 0;
+    for (int o = 0; o < c->cout; o++)
+        for (int ci = 0; ci < c->cin; ci++)
+            for (int t = 0; t < kk; t++)
+                tmp[o * row + (size_t)t * c->cin + ci] =
+                    f32_to_bf16(c->w[((size_t)o * c->cin + ci) * kk + t]);
+    d->w = iris_dev_alloc(n * sizeof(uint16_t));
+    if (d->w) iris_dev_upload(d->w, tmp, n * sizeof(uint16_t));
+    free(tmp);
+    d->b = dv_f32(c->b, c->cout);
+    return d->w && d->b;
+}
+
+static int dv_res(qd_res_t *d, const qv_res_t *r) {
+    d->gamma1 = dv_f32(r->gamma1, r->cin);
+    d->gamma2 = dv_f32(r->gamma2, r->cout);
+    return d->gamma1 && d->gamma2 && dv_conv(&d->conv1, &r->conv1) &&
+           dv_conv(&d->conv2, &r->conv2) && dv_conv(&d->shortcut, &r->shortcut);
+}
+
+static void dv_free_conv(qd_conv_t *d) {
+    iris_dev_free(d->w);
+    iris_dev_free(d->b);
+}
+
+static void dv_free_res(qd_res_t *d) {
+    iris_dev_free(d->gamma1);
+    iris_dev_free(d->gamma2);
+    dv_free_conv(&d->conv1);
+    dv_free_conv(&d->conv2);
+    dv_free_conv(&d->shortcut);
+}
+
+static void dv_free_buffers(struct qv_dev *d) {
+    for (int i = 0; i < 4; i++) {
+        iris_dev_free(d->buf[i]);
+        d->buf[i] = NULL;
+    }
+    iris_dev_free(d->skip);
+    iris_dev_free(d->attn);
+    d->skip = NULL;
+    d->attn = NULL;
+    d->buf_elems = d->skip_elems = d->attn_elems = 0;
+}
+
+static void dv_free(iris_vae_qimage_t *vae) {
+    struct qv_dev *d = vae->dev;
+    if (!d) return;
+    dv_free_conv(&d->post_quant);
+    dv_free_conv(&d->conv_in);
+    dv_free_conv(&d->conv_out);
+    dv_free_conv(&d->attn_qkv);
+    dv_free_conv(&d->attn_proj);
+    dv_free_res(&d->mid_res[0]);
+    dv_free_res(&d->mid_res[1]);
+    for (int i = 0; i < vae->num_up; i++) {
+        for (int r = 0; r < vae->up[i].num_res; r++) dv_free_res(&d->res[i][r]);
+        dv_free_conv(&d->up_conv[i]);
+    }
+    iris_dev_free(d->attn_gamma);
+    iris_dev_free(d->norm_out);
+    dv_free_buffers(d);
+    free(d);
+    vae->dev = NULL;
+}
+
+static int dv_load(iris_vae_qimage_t *vae) {
+    struct qv_dev *d = calloc(1, sizeof(*d));
+    if (!d) return 0;
+    vae->dev = d;
+    int top = vae->mid_res[0].cout, last = vae->up[vae->num_up - 1].cout;
+    int ok = dv_conv(&d->post_quant, &vae->post_quant) && dv_conv(&d->conv_in, &vae->conv_in) &&
+             dv_conv(&d->conv_out, &vae->conv_out) && dv_conv(&d->attn_qkv, &vae->attn_qkv) &&
+             dv_conv(&d->attn_proj, &vae->attn_proj) && dv_res(&d->mid_res[0], &vae->mid_res[0]) &&
+             dv_res(&d->mid_res[1], &vae->mid_res[1]);
+    for (int i = 0; ok && i < vae->num_up; i++) {
+        for (int r = 0; ok && r < vae->up[i].num_res; r++)
+            ok = dv_res(&d->res[i][r], &vae->up[i].res[r]);
+        ok = ok && dv_conv(&d->up_conv[i], &vae->up[i].up_conv);
+    }
+    d->attn_gamma = ok ? dv_f32(vae->attn_gamma, top) : NULL;
+    d->norm_out = ok ? dv_f32(vae->norm_out, last) : NULL;
+    if (!d->attn_gamma || !d->norm_out) {
+        dv_free(vae);
+        return 0;
+    }
+    iris_dev_sync();
+    return 1;
+}
+
+/* Size the activations for a latent of h x w pixels. */
+static int dv_ensure(iris_vae_qimage_t *vae, int h, int w) {
+    struct qv_dev *d = vae->dev;
+    size_t hw = (size_t)h * w, top = vae->mid_res[0].cout;
+    size_t need = hw * 3 * top, skip = 0, attn = hw * 4 * top;
+    for (int i = 0; i < vae->num_up; i++) {
+        const qv_up_t *u = &vae->up[i];
+        size_t c = u->cin > u->cout ? u->cin : u->cout;
+        if (hw * c > need) need = hw * c;
+        if (u->upsample) {
+            if (hw * u->cin > skip) skip = hw * u->cin;
+            hw *= 4;
+            if (hw * u->cout > need) need = hw * u->cout;
+        }
+    }
+    if (need <= d->buf_elems && skip <= d->skip_elems && attn <= d->attn_elems) return 1;
+    dv_free_buffers(d);
+    int ok = 1;
+    for (int i = 0; i < 4; i++) {
+        d->buf[i] = iris_dev_alloc(need * sizeof(float));
+        ok = ok && d->buf[i];
+    }
+    d->skip = iris_dev_alloc(skip * sizeof(float));
+    d->attn = iris_dev_alloc(attn * sizeof(uint16_t));
+    if (!ok || !d->skip || !d->attn) {
+        dv_free_buffers(d);
+        return 0;
+    }
+    d->buf_elems = need;
+    d->skip_elems = skip;
+    d->attn_elems = attn;
+    return 1;
+}
+
+static void dv_conv2d(float *out, const float *in, const qd_conv_t *d, const qv_conv_t *c,
+                      int h, int w) {
+    iris_dev_conv2d(out, in, d->w, d->b, h, w, c->cin, c->cout, c->k, 1, c->k / 2, c->k / 2);
+}
+
+/* out = shortcut(x) + conv2(silu(norm2(conv1(silu(norm1(x)))))) */
+static void dv_res_forward(const qd_res_t *d, const qv_res_t *r, float *out, const float *x,
+                           float *t1, float *t2, int h, int w) {
+    int hw = h * w;
+    iris_dev_pixel_rms_norm(t1, x, d->gamma1, hw, r->cin, 1);
+    dv_conv2d(t2, t1, &d->conv1, &r->conv1, h, w);
+    iris_dev_pixel_rms_norm(t2, t2, d->gamma2, hw, r->cout, 1);
+    dv_conv2d(out, t2, &d->conv2, &r->conv2, h, w);
+    if (d->shortcut.w) {
+        dv_conv2d(t1, x, &d->shortcut, &r->shortcut, h, w);
+        iris_dev_add(out, t1, (size_t)hw * r->cout);
+    } else {
+        iris_dev_add(out, x, (size_t)hw * r->cout);
+    }
+}
+
+/* Single-head self-attention over the n pixels, plus the residual. */
+static void dv_attention(iris_vae_qimage_t *vae, float *out, const float *x, float *t1,
+                         float *t2, int n, int c) {
+    struct qv_dev *d = vae->dev;
+    uint16_t *qkv = d->attn, *o = qkv + (size_t)n * 3 * c;
+    iris_dev_pixel_rms_norm(t1, x, d->attn_gamma, n, c, 0);
+    dv_conv2d(t2, t1, &d->attn_qkv, &vae->attn_qkv, n, 1);
+    iris_dev_f32_to_bf16(qkv, t2, (size_t)n * 3 * c);
+    iris_dev_attention(o, c, qkv, qkv + c, qkv + 2 * c, 3 * c, n, n, 1, 1, c,
+                       1.0f / sqrtf((float)c), 0, NULL);
+    iris_dev_linear_f32(out, o, d->attn_proj.w, n, c, c);
+    iris_dev_add_bias(out, d->attn_proj.b, n, c);
+    iris_dev_add(out, x, (size_t)n * c);
+}
+
+static iris_image *decode_dev(iris_vae_qimage_t *vae, const float *latent, int h, int w) {
+    if (!vae->dev && !dv_load(vae)) return NULL;
+    if (!dv_ensure(vae, h, w)) return NULL;
+    struct qv_dev *d = vae->dev;
+    float *x = d->buf[0], *y = d->buf[1], *t1 = d->buf[2], *t2 = d->buf[3], *tmp;
+#define DV_SWAP() (tmp = x, x = y, y = tmp)
+
+    int z = vae->z_dim, top = vae->mid_res[0].cout;
+    size_t hw = (size_t)h * w;
+    float *host = malloc((size_t)z * hw * sizeof(float));
+    if (!host) return NULL;
+    for (int c = 0; c < z; c++)
+        for (size_t p = 0; p < hw; p++)
+            host[p * z + c] = latent[c * hw + p] * vae->std[c] + vae->mean[c];
+    iris_dev_upload(x, host, (size_t)z * hw * sizeof(float));
+    free(host);
+
+    dv_conv2d(y, x, &d->post_quant, &vae->post_quant, h, w);
+    dv_conv2d(x, y, &d->conv_in, &vae->conv_in, h, w);
+    dv_res_forward(&d->mid_res[0], &vae->mid_res[0], y, x, t1, t2, h, w);
+    dv_attention(vae, x, y, t1, t2, (int)hw, top);
+    dv_res_forward(&d->mid_res[1], &vae->mid_res[1], y, x, t1, t2, h, w);
+    DV_SWAP();
+
+    for (int i = 0; i < vae->num_up; i++) {
+        const qv_up_t *u = &vae->up[i];
+        /* A byte copy of the block input for the DupUp shortcut. */
+        if (u->upsample)
+            iris_dev_copy_2d((uint16_t *)d->skip, 2 * u->cin, (const uint16_t *)x, 2 * u->cin,
+                             h * w, 2 * u->cin);
+        for (int r = 0; r < u->num_res; r++) {
+            dv_res_forward(&d->res[i][r], &u->res[r], y, x, t1, t2, h, w);
+            DV_SWAP();
+        }
+        if (u->upsample) {
+            iris_dev_upsample2x(y, x, h, w, u->cout);
+            dv_conv2d(x, y, &d->up_conv[i], &u->up_conv, 2 * h, 2 * w);
+            iris_dev_dup_up_add(x, d->skip, h, w, u->cin, u->cout, u->factor_t);
+            h *= 2;
+            w *= 2;
+        }
+        if (iris_vae_progress_callback) iris_vae_progress_callback(i + 1, vae->num_up);
+    }
+#undef DV_SWAP
+
+    int c = vae->up[vae->num_up - 1].cout, channels = vae->out_channels;
+    iris_dev_pixel_rms_norm(y, x, d->norm_out, h * w, c, 1);
+    dv_conv2d(t1, y, &d->conv_out, &vae->conv_out, h, w);
+
+    hw = (size_t)h * w;
+    float *hwc = malloc((size_t)channels * hw * sizeof(float));
+    float *rgba = malloc((size_t)channels * hw * sizeof(float));
+    iris_image *img = NULL;
+    if (hwc && rgba) {
+        iris_dev_download(hwc, t1, (size_t)channels * hw * sizeof(float));
+        for (int ch = 0; ch < channels; ch++)
+            for (size_t p = 0; p < hw; p++) rgba[ch * hw + p] = hwc[p * channels + ch];
+        img = rgba_to_image(rgba, channels, h, w);
+    }
+    free(hwc);
+    free(rgba);
+    return img;
+}
+#endif /* IRIS_DEV */
+
 /* ========================================================================
  * Decode
  * ======================================================================== */
 
 iris_image *iris_vae_decode_qimage(iris_vae_qimage_t *vae, const float *latent,
                                    int h, int w) {
+#ifdef IRIS_DEV
+    if (iris_dev_available()) {
+        iris_image *img = decode_dev(vae, latent, h, w);
+        if (img) return img;
+        fprintf(stderr, "Qwen-Image VAE: GPU decode failed, using the CPU\n");
+    }
+#endif
     size_t hw = (size_t)h * w;
     float *z = malloc((size_t)vae->z_dim * hw * sizeof(float));
     for (int c = 0; c < vae->z_dim; c++)
@@ -273,27 +584,7 @@ iris_image *iris_vae_decode_qimage(iris_vae_qimage_t *vae, const float *latent,
     float *rgba = conv(&vae->conv_out, x, oh, ow);
     free(x);
 
-    /* [-1, 1] -> 8 bit, like diffusers (clamp, then round(v * 255)). */
-    size_t npix = (size_t)oh * ow;
-    int channels = vae->out_channels;
-    iris_image *img = iris_image_create(ow, oh, channels);
-    if (img) {
-        int opaque = channels == 4;
-        for (size_t p = 0; p < npix; p++) {
-            for (int ch = 0; ch < channels; ch++) {
-                float v = rgba[ch * npix + p];
-                v = v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);
-                img->data[p * channels + ch] = (uint8_t)((v + 1.0f) * 127.5f + 0.5f);
-            }
-            if (opaque && img->data[p * channels + 3] != 255) opaque = 0;
-        }
-        /* Drop the alpha channel of a fully opaque image. */
-        if (opaque) {
-            for (size_t p = 0; p < npix; p++)
-                memmove(img->data + p * 3, img->data + p * 4, 3);
-            img->channels = 3;
-        }
-    }
+    iris_image *img = rgba_to_image(rgba, vae->out_channels, oh, ow);
     free(rgba);
     return img;
 }
@@ -514,6 +805,9 @@ iris_vae_qimage_t *iris_vae_load_qimage(const char *model_dir) {
 
 void iris_vae_free_qimage(iris_vae_qimage_t *vae) {
     if (!vae) return;
+#ifdef IRIS_DEV
+    dv_free(vae);
+#endif
     free_conv(&vae->post_quant);
     free_conv(&vae->conv_in);
     free_conv(&vae->conv_out);
