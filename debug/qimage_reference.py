@@ -349,6 +349,7 @@ def main():
     ap.add_argument("--image", action="append", default=[], help="reference image (repeatable)")
     ap.add_argument("--ref-resolution", type=int, default=1024,
                     help="the pipeline's output_resolution, sizes the references")
+    ap.add_argument("--text-only", action="store_true", help="stop after the text encoder")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("-o", "--out-dir", default="/tmp/qimage_ref")
     args = ap.parse_args()
@@ -380,6 +381,8 @@ def main():
     else:
         emb, pad = encode(args.model_dir, args.prompt, args.device, out, vision)
     dump(out("emb.bin"), emb)
+    if args.text_only:
+        return
 
     ref_tokens, ref_shapes = encode_refs(args.model_dir, vae_in, args.device, out) if vae_in else (None, [])
     tokens = denoise(args.model_dir, emb, h, w, args, args.device, out, pad, ref_tokens, ref_shapes)

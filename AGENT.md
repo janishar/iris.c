@@ -50,10 +50,11 @@ Qwen-Image 2.1 variants (Qwen Research License, non-commercial):
   are prepared like the official image processor: one reference is kept whole
   (downscaled so its 16-px canvas fits 4 MP, reflect-padded, output cropped back),
   several are downscaled under 1 MP and center-cropped. Side cap: IRIS_VAE_MAX_DIM.
-- Qwen-Image supports txt2img and one reference image (`-i`). A reference is
-  sized to about 1024x1024 and takes about 1024 of the 1280 text encoder
-  tokens: two do not fit yet, and a prompt with one is limited to about 228
-  tokens. Above the limit the generation fails with an error.
+- Qwen-Image supports txt2img and reference images (`-i`, up to 16). A reference is
+  sized to about 1024x1024 and takes about 1024 text encoder tokens and 4096
+  prefix tokens. QWEN3_QIMAGE_MAX_SEQ_LEN (17280) limits the encoder sequence.
+  A run over it, or over the memory estimate, fails before any expensive stage
+  (see Qwen-Image Long Sequences). A text-only prompt over it is cut with a warning.
 - Text embeddings are generated via Qwen3.
 - VAE is used for latent/image conversion in both families.
 
@@ -525,6 +526,8 @@ theta 10000 (hardcoded upstream), eps 1e-6, causal_condition=true. No biases.
   are dropped. Embedding = last layer output BEFORE the final norm.
 - Only real tokens reach the transformer; the encoder pads to a multiple of
   80 after them (causal, so harmless).
+- Work buffers follow the real sequence (qwen3_ensure_work). attn_scores holds
+  one head, seq^2 floats: the CPU path runs heads one at a time.
 - Tokenizer may live in `processor/`; Turbo's encoder may be one
   `model.safetensors`.
 
@@ -548,6 +551,37 @@ With references (qwen3_encode_images):
   -W -H the target follows the
   LAST reference at 1024x1024 area (FLUX.3 follows the first), and -W -H never
   change the reference size.
+
+# Qwen-Image Long Sequences
+
+- A reference takes about 1024 encoder tokens: two need 2100, ten 10300.
+- Metal encoder: up to CAUSAL_ATTENTION_MAX_SEQ (1280, threadgroup scores, Metal
+  allows 32 KB) the native iris_metal.m path, which FLUX.3 and the byte-exact
+  numbers rest on. Above it qwen3_forward_dev, the same path CUDA and ROCm use
+  for everything. Both are bf16, the device path is the closer one: text rows
+  1.1% against 6.0% off float32 at 1075 tokens, 1.6% at 2100, upstream bf16 6.8%.
+- iris_dev_attention on Metal: GQA by broadcasting the query heads of a kv head
+  against it, and queries split in chunks of ATTN_MAX_SCORES scores, raising
+  causal (query i sees keys j < i + n). That is what runs a long causal segment
+  of the prefill too. The causal bias is computed in the graph, a constant
+  would stay with every cached graph. CUDA needs none of this: its GEMM path
+  already works in query chunks of ATTN_SCRATCH.
+- ATTN_MAX_SCORES (2^31) sits above every byte-exact case: at 2^29 the 1-MP
+  reference runs split, and MPSGraph rounds a split run differently.
+- iris_refs_fit_qimage() refuses a run before the first stage, from
+  qwen3_count_images() (tokenizer only) and iris_transformer_memory_qimage()
+  against iris_dev_memory() (Metal: the working set budget, capped by free and
+  file-backed pages) or 90% of the RAM on the CPU. The check is for references;
+  the estimate is from the config and was calibrated on Metal.
+- Measured on an M5 Pro with 64 GB, 8 Turbo steps at the default 1024x1024: 10
+  references take 142 s and 51.3 GB, 11 take 165 s and 51.5 GB, 12 are refused
+  (57.4 GB estimated against the 55.7 GB budget). Text encoder: 15 s and 20 GB
+  for 10600 tokens.
+- A free run with two or more references can end far from float32 although
+  each step does not: r9 (two references, a vague prompt) has velocities within
+  1.5-2.3% and the latent 28% off. A 1e-6 noise change moves it 2e-5, and the
+  float32 pipeline fed upstream's bf16 embeddings ends 21% off. A prompt that
+  pins the scene ends 3% off.
 
 # Qwen3-VL Vision Tower
 
@@ -578,6 +612,7 @@ With references (qwen3_encode_images):
    runs amplify it: a 1e-6 change of the noise moves the two-reference test
    (r2) by 1e-5 against 1.7e-6 with one reference, so that run ends 3.8% off
    on Metal and 4.4% off in upstream bf16, and 1e-4 off on the CPU in f32.
+   Long sequences do the same: 2100 and 3100 tokens end 2.5e-4 off on the CPU.
 4. **Causal device attention**: the prefill is the only causal caller of
    iris_dev_attention in MPS builds. Metal used to return without writing, so
    text keys lost their attention output and velocities were 11-32% off.
@@ -610,8 +645,8 @@ With references (qwen3_encode_images):
   Work goes into one command buffer, committed by sync/download/upload/free.
   GEMMs and attention use MPSGraph (bf16 matmul, fused SDPA on contiguous
   copies of q/k/v, key mask and causal triangle as an additive bias). In MPS
-  builds the transformers and the Qwen-Image VAE use it: the Qwen3 and Flux
-  VAE device paths are compiled out (QWEN3_DEV / VAE_DEV).
+  builds the transformers, the Qwen-Image VAE and the encoder past 1280 tokens
+  use it: the Flux VAE device path is compiled out (VAE_DEV).
 
 Known pitfalls:
 1. rocBLAS has only fallback (slow) bf16 -> f32 GEMM kernels on gfx1151:

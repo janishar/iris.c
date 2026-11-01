@@ -16,9 +16,13 @@
 #include <math.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #ifdef USE_METAL
 #include "iris_metal.h"
+#endif
+#ifdef IRIS_DEV
+#include "iris_dev.h"
 #endif
 
 /* ========================================================================
@@ -1354,6 +1358,15 @@ static iris_image *iris_generate_qimage(iris_ctx *ctx, const char *prompt,
 }
 
 /* VAE latents of the prepared references, then release the encoder. */
+/* Memory the transformer can use now: device memory on a GPU, otherwise most
+ * of the RAM. */
+static size_t iris_available_memory(void) {
+#ifdef IRIS_DEV
+    if (iris_dev_available()) return iris_dev_memory();
+#endif
+    return (size_t)sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE) / 10 * 9;
+}
+
 static int iris_encode_refs_qimage(iris_ctx *ctx, iris_image **rgba,
                                    iris_qimage_ref_t *refs, int n) {
     int ok = 1;
@@ -1407,6 +1420,44 @@ static int iris_vision_refs_qimage(iris_ctx *ctx, iris_image **rgba,
     return ok;
 }
 
+/* What the sequence limit and the memory of this machine allow: refuse a
+ * run here, before any stage has spent time on it. target: latent tokens. */
+static int iris_refs_fit_qimage(iris_ctx *ctx, const char *prompt, iris_image **rgba, int n,
+                                int target) {
+    int *slots = malloc(n * sizeof(int));
+    if (!slots) {
+        set_error("Out of memory");
+        return 0;
+    }
+    int slot_tokens = 0, ref_tokens = 0;
+    for (int i = 0; i < n; i++) {
+        slots[i] = rgba[i]->height / 32 * (rgba[i]->width / 32);
+        slot_tokens += slots[i];
+        ref_tokens += rgba[i]->height / 16 * (rgba[i]->width / 16);
+    }
+    int tokens = qwen3_count_images(ctx->model_dir, prompt, slots, n);
+    free(slots);
+
+    char err[160];
+    if (tokens <= 0 || tokens > QWEN3_QIMAGE_MAX_SEQ_LEN) {
+        snprintf(err, sizeof(err), "The prompt and its references need %d text encoder "
+                 "tokens, the limit is %d", tokens, QWEN3_QIMAGE_MAX_SEQ_LEN);
+        set_error(err);
+        return 0;
+    }
+    size_t need = iris_transformer_memory_qimage(ctx->model_dir,
+                                                 tokens - slot_tokens + ref_tokens + target,
+                                                 !ctx->qimage_transformer);
+    size_t have = iris_available_memory();
+    if (need > have) {
+        snprintf(err, sizeof(err), "%d references need about %.1f GB of memory, %.1f GB "
+                 "are available", n, need / 1e9, have / 1e9);
+        set_error(err);
+        return 0;
+    }
+    return 1;
+}
+
 /* The pipeline with reference images, one stage at a time so that each is
  * freed before the next loads: prepare, VAE encoder, vision tower, text
  * encoder, then the common prefill, sampling and decode. Without an explicit
@@ -1433,22 +1484,15 @@ iris_image *iris_generate_refs_qimage(iris_ctx *ctx, const char *prompt,
         goto done;
     }
 
-    int slots = 0, text_seq;
+    int text_seq;
     for (int i = 0; i < n; i++) {
         rgba[i] = iris_ref_prepare_qimage(refs[i], ref_area);
         if (!rgba[i]) {
             set_error("Failed to prepare a reference image");
             goto done;
         }
-        slots += rgba[i]->height / 32 * (rgba[i]->width / 32);
     }
-    if (slots > QWEN3_VL_MAX_SEQ_LEN) {
-        char err[128];
-        snprintf(err, sizeof(err), "References need %d text encoder tokens, the limit is %d",
-                 slots, QWEN3_VL_MAX_SEQ_LEN);
-        set_error(err);
-        goto done;
-    }
+    if (!iris_refs_fit_qimage(ctx, prompt, rgba, n, p.height / 16 * (p.width / 16))) goto done;
 
     /* A previous generation's transformer would sit beside all three encoders. */
     iris_transformer_free_qimage(ctx->qimage_transformer);

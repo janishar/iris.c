@@ -3112,9 +3112,6 @@ static id<MTLComputePipelineState> g_softmax_pipeline = nil;
 static id<MTLComputePipelineState> g_rope_2d_pipeline = nil;
 static id<MTLComputePipelineState> g_rope_unified_pipeline = nil;
 static id<MTLComputePipelineState> g_causal_attention_pipeline = nil;
-/* The same limit as iris_shaders.metal, which sizes its threadgroup scores by it */
-#define CAUSAL_ATTENTION_MAX_SEQ 1280
-
 static id<MTLComputePipelineState> g_causal_attention_bf16_pipeline = nil;
 static id<MTLComputePipelineState> g_rope_bf16_pipeline = nil;
 static id<MTLComputePipelineState> g_head_rms_norm_bf16_pipeline = nil;

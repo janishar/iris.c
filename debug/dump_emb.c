@@ -38,6 +38,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "failed to load %s: %s\n", argv[1], iris_get_error());
         return 1;
     }
+    iris_set_mmap(ctx, 1);   /* as the CLI */
     int seq = 0, dim = iris_text_dim(ctx);
     float *emb = iris_encode_text(ctx, argv[2], &seq);
     FILE *f = fopen(argv[3], "wb");

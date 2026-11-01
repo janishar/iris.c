@@ -23,6 +23,7 @@ extern "C" {
 #define QWEN3_VOCAB_SIZE       151936
 #define QWEN3_MAX_SEQ_LEN      512
 #define QWEN3_VL_MAX_SEQ_LEN   1280  /* Flux3 (Qwen3-VL): 16 windows of 80 tokens */
+#define QWEN3_QIMAGE_MAX_SEQ_LEN 17280  /* Qwen-Image: 16 references at 1 MP and a prompt */
 #define QWEN3_FLUX3_PAD_MULTIPLE 80  /* Flux3 pads the prompt to a multiple of this */
 #define QWEN3_RMS_NORM_EPS     1e-6f
 #define QWEN3_ROPE_THETA       1000000.0f
@@ -197,6 +198,12 @@ float *qwen3_encode_text(qwen3_encoder_t *enc, const char *prompt);
  */
 float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
                               int *out_num_tokens, int *out_seq_len);
+
+/*
+ * Encoder tokens of a Qwen-Image prompt with n images of slots[i] tokens,
+ * from the tokenizer alone (no encoder load). Returns 0 on failure.
+ */
+int qwen3_count_images(const char *model_dir, const char *prompt, const int *slots, int n);
 
 /*
  * Encode a Qwen-Image prompt with n reference images, in

@@ -31,10 +31,16 @@
 #include "iris_metal.h"
 #endif
 
-/* CUDA / ROCm device backend (Metal builds keep the native Metal Qwen3 encoder) */
-#if defined(IRIS_DEV) && !defined(USE_METAL)
+/* Device backend: the whole encoder on CUDA / ROCm. Metal builds keep the native
+ * Metal encoder and use it only for what the native kernels cannot hold. */
+#ifdef IRIS_DEV
 #define QWEN3_DEV
 #include "iris_dev.h"
+#ifdef USE_METAL
+#define QWEN3_DEV_MIN_SEQ (CAUSAL_ATTENTION_MAX_SEQ + 1)
+#else
+#define QWEN3_DEV_MIN_SEQ 0
+#endif
 #endif
 
 /* Minimum matrix size for GPU acceleration.
@@ -99,7 +105,8 @@ struct qwen3_model {
     int extraction_mode;      /* QWEN3_EXTRACT_* */
     int out_layers[QWEN3_MAX_OUTPUT_LAYERS];  /* 0-based layers forming the embeddings */
     int num_out_layers;
-    int max_seq_len;          /* QWEN3_MAX_SEQ_LEN, QWEN3_VL_MAX_SEQ_LEN for Qwen3-VL */
+    int max_seq_len;          /* QWEN3_MAX_SEQ_LEN, QWEN3_VL_MAX_SEQ_LEN for Qwen3-VL,
+                               * QWEN3_QIMAGE_MAX_SEQ_LEN for Qwen-Image */
     char prefix[32];          /* Tensor names: "model." or "model.language_model." */
 
     /* Embedding layer */
@@ -113,8 +120,8 @@ struct qwen3_model {
     float *norm_weight;       /* [hidden] */
 
     /* RoPE tables, filled for each forward pass */
-    float *rope_cos;          /* [max_seq_len, head_dim/2] */
-    float *rope_sin;          /* [max_seq_len, head_dim/2] */
+    float *rope_cos;          /* [seq_len, head_dim/2] */
+    float *rope_sin;          /* [seq_len, head_dim/2] */
     int mrope_h, mrope_w;     /* mrope_section[1..2], 0 without one */
 
     /* Images of the prompt being encoded (Qwen-Image references) */
@@ -122,13 +129,14 @@ struct qwen3_model {
     const int *image_rows;    /* first slot row of each image */
     int num_images;
 
-    /* Working memory */
+    /* Working memory, grown to the longest sequence seen */
+    int work_seq;             /* sequence length it holds */
     float *hidden_state;      /* [seq_len, hidden] */
     float *residual;          /* [seq_len, hidden] */
     float *q_buf;             /* [seq_len, num_heads * head_dim] */
     float *k_buf;             /* [seq_len, num_kv_heads * head_dim] */
     float *v_buf;             /* [seq_len, num_kv_heads * head_dim] */
-    float *attn_scores;       /* [num_heads, seq_len, seq_len] */
+    float *attn_scores;       /* [seq_len, seq_len], one head at a time */
     float *attn_out;          /* [seq_len, num_heads * head_dim] */
     float *mlp_gate;          /* [seq_len, intermediate] */
     float *mlp_up;            /* [seq_len, intermediate] */
@@ -440,7 +448,7 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
 
         for (int h = 0; h < num_heads; h++) {
             int kv_h = h / heads_per_kv;  /* Which KV head to use */
-            float *scores = model->attn_scores + h * seq_len * seq_len;
+            float *scores = model->attn_scores;
 
             /* Q accessed directly with strided lda (avoids copy)
              * Q[s,d] = q_buf[s * q_dim + h * head_dim + d] */
@@ -1125,6 +1133,61 @@ static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *atten
 #endif /* USE_METAL */
 
 /* ========================================================================
+ * Working Memory
+ * ======================================================================== */
+
+static void qwen3_free_work(qwen3_model_t *model) {
+    float **buffers[] = {
+        &model->hidden_state, &model->residual, &model->q_buf, &model->k_buf, &model->v_buf,
+        &model->attn_scores, &model->attn_out, &model->mlp_gate, &model->mlp_up,
+        &model->mlp_out, &model->norm_buf, &model->attn_q_head, &model->attn_v_head,
+        &model->attn_out_head, &model->rope_cos, &model->rope_sin};
+    for (size_t i = 0; i < sizeof(buffers) / sizeof(buffers[0]); i++) {
+        free(*buffers[i]);
+        *buffers[i] = NULL;
+    }
+    for (int i = 0; i < QWEN3_MAX_OUTPUT_LAYERS; i++) {
+        free(model->layer_outputs[i]);
+        model->layer_outputs[i] = NULL;
+    }
+    model->work_seq = 0;
+}
+
+/* Size the work buffers for seq tokens. Returns 0 if they do not fit. */
+static int qwen3_ensure_work(qwen3_model_t *model, int seq) {
+    if (seq <= model->work_seq) return 1;
+    qwen3_free_work(model);
+
+    size_t bytes = (size_t)seq * sizeof(float);
+    size_t hidden = model->hidden_size, inter = model->intermediate_size;
+    size_t head_dim = model->head_dim, q_dim = model->num_heads * head_dim;
+    size_t kv_dim = model->num_kv_heads * head_dim;
+    struct { float **p; size_t size; } buffers[] = {
+        {&model->hidden_state, hidden}, {&model->residual, hidden}, {&model->q_buf, q_dim},
+        {&model->k_buf, kv_dim}, {&model->v_buf, kv_dim}, {&model->attn_scores, seq},
+        {&model->attn_out, q_dim}, {&model->mlp_gate, inter}, {&model->mlp_up, inter},
+        {&model->mlp_out, hidden}, {&model->norm_buf, hidden}, {&model->attn_q_head, head_dim},
+        {&model->attn_v_head, head_dim}, {&model->attn_out_head, head_dim},
+        {&model->rope_cos, head_dim / 2}, {&model->rope_sin, head_dim / 2}};
+    int ok = 1;
+    for (size_t i = 0; i < sizeof(buffers) / sizeof(buffers[0]); i++) {
+        *buffers[i].p = malloc(bytes * buffers[i].size);
+        ok = ok && *buffers[i].p;
+    }
+    for (int i = 0; i < QWEN3_MAX_OUTPUT_LAYERS; i++) {
+        model->layer_outputs[i] = malloc(bytes * hidden);
+        ok = ok && model->layer_outputs[i];
+    }
+    if (!ok) {
+        fprintf(stderr, "Qwen3: not enough memory for %d tokens\n", seq);
+        qwen3_free_work(model);
+        return 0;
+    }
+    model->work_seq = seq;
+    return 1;
+}
+
+/* ========================================================================
  * Forward Pass
  * ======================================================================== */
 
@@ -1142,7 +1205,7 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
     int last_layer = out_layers[num_out - 1];
     float *output;
 
-    if (seq_len > model->max_seq_len) return NULL;
+    if (seq_len > model->max_seq_len || !qwen3_ensure_work(model, seq_len)) return NULL;
     qwen3_set_rope_positions(model, attention_mask, seq_len);
 
     /* Embedding lookup */
@@ -1165,8 +1228,8 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
 
     /* Run through transformer layers */
 #ifdef QWEN3_DEV
-    /* CUDA / ROCm: whole forward pass on the GPU, weights from the mmap */
-    if (iris_dev_available() && model->use_mmap &&
+    /* Whole forward pass on the GPU, weights from the mmap */
+    if (iris_dev_available() && model->use_mmap && seq_len >= QWEN3_DEV_MIN_SEQ &&
         qwen3_forward_dev(model, seq_len, attention_mask, out_layers, num_out))
         goto concatenate;
 #endif
@@ -1861,40 +1924,6 @@ static int qwen3_load_globals(qwen3_model_t *model,
     return (model->embed_tokens && model->norm_weight) ? 0 : -1;
 }
 
-/* Allocate working memory for Qwen3 model based on architecture fields. */
-static void qwen3_alloc_work_buffers(qwen3_model_t *model) {
-    int seq_len = model->max_seq_len;
-    int hidden = model->hidden_size;
-    int num_heads = model->num_heads;
-    int num_kv_heads = model->num_kv_heads;
-    int head_dim = model->head_dim;
-    int intermediate = model->intermediate_size;
-
-    model->hidden_state = malloc(seq_len * hidden * sizeof(float));
-    model->residual = malloc(seq_len * hidden * sizeof(float));
-    model->q_buf = malloc(seq_len * num_heads * head_dim * sizeof(float));
-    model->k_buf = malloc(seq_len * num_kv_heads * head_dim * sizeof(float));
-    model->v_buf = malloc(seq_len * num_kv_heads * head_dim * sizeof(float));
-    model->attn_scores = malloc(num_heads * seq_len * seq_len * sizeof(float));
-    model->attn_out = malloc(seq_len * num_heads * head_dim * sizeof(float));
-    model->mlp_gate = malloc(seq_len * intermediate * sizeof(float));
-    model->mlp_up = malloc(seq_len * intermediate * sizeof(float));
-    model->mlp_out = malloc(seq_len * hidden * sizeof(float));
-    model->norm_buf = malloc(seq_len * hidden * sizeof(float));
-
-    model->attn_q_head = malloc(seq_len * head_dim * sizeof(float));
-    model->attn_v_head = malloc(seq_len * head_dim * sizeof(float));
-    model->attn_out_head = malloc(seq_len * head_dim * sizeof(float));
-
-    for (int i = 0; i < QWEN3_MAX_OUTPUT_LAYERS; i++) {
-        model->layer_outputs[i] = malloc(seq_len * hidden * sizeof(float));
-    }
-
-    int half_dim = head_dim / 2;
-    model->rope_cos = malloc(seq_len * half_dim * sizeof(float));
-    model->rope_sin = malloc(seq_len * half_dim * sizeof(float));
-}
-
 /* Eager-mode model loading: reads all weights into RAM upfront. Parses
  * config.json for architecture parameters (hidden size, head counts, etc.),
  * loads all layer weights from safetensors shards, and precomputes RoPE
@@ -1942,7 +1971,6 @@ qwen3_model_t *qwen3_model_load(const char *model_dir) {
     for (int i = 0; i < num_files; i++) safetensors_close(files[i]);
 
     /* Allocate working memory */
-    qwen3_alloc_work_buffers(model);
 
     return model;
 
@@ -2004,7 +2032,6 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
         fprintf(stderr, "Mmap mode: layer weights will be loaded on-demand\n");
 
     /* Allocate working memory */
-    qwen3_alloc_work_buffers(model);
 
     return model;
 
@@ -2018,8 +2045,6 @@ void qwen3_model_free(qwen3_model_t *model) {
 
     free(model->embed_tokens);
     free(model->norm_weight);
-    free(model->rope_cos);
-    free(model->rope_sin);
 
     if (model->layers) {
         for (int i = 0; i < model->num_layers; i++) {
@@ -2039,26 +2064,7 @@ void qwen3_model_free(qwen3_model_t *model) {
         free(model->layers);
     }
 
-    free(model->hidden_state);
-    free(model->residual);
-    free(model->q_buf);
-    free(model->k_buf);
-    free(model->v_buf);
-    free(model->attn_scores);
-    free(model->attn_out);
-    free(model->mlp_gate);
-    free(model->mlp_up);
-    free(model->mlp_out);
-    free(model->norm_buf);
-
-    /* Free attention work buffers */
-    free(model->attn_q_head);
-    free(model->attn_v_head);
-    free(model->attn_out_head);
-
-    for (int i = 0; i < QWEN3_MAX_OUTPUT_LAYERS; i++) {
-        free(model->layer_outputs[i]);
-    }
+    qwen3_free_work(model);
 
 #ifdef QWEN3_DEV
     qwen3_dev_free(model);
@@ -2076,12 +2082,8 @@ void qwen3_model_free(qwen3_model_t *model) {
  * Combined Encoder API
  * ======================================================================== */
 
-qwen3_encoder_t *qwen3_encoder_load(const char *model_dir, int use_mmap) {
-    qwen3_encoder_t *enc = calloc(1, sizeof(qwen3_encoder_t));
-    if (!enc) return NULL;
-
-    /* Load tokenizer (Flux3 ships it inside text_encoder/, Qwen-Image
-     * inside processor/) */
+/* Flux3 ships the tokenizer inside text_encoder/, Qwen-Image inside processor/. */
+static qwen3_tokenizer_t *qwen3_tokenizer_load_dir(const char *model_dir) {
     static const char *tok_dirs[] = {"tokenizer", "text_encoder", "processor"};
     char tok_path[512];
     for (int i = 0; i < 3; i++) {
@@ -2092,7 +2094,14 @@ qwen3_encoder_t *qwen3_encoder_load(const char *model_dir, int use_mmap) {
             break;
         }
     }
-    enc->tokenizer = qwen3_tokenizer_load(tok_path);
+    return qwen3_tokenizer_load(tok_path);
+}
+
+qwen3_encoder_t *qwen3_encoder_load(const char *model_dir, int use_mmap) {
+    qwen3_encoder_t *enc = calloc(1, sizeof(qwen3_encoder_t));
+    if (!enc) return NULL;
+
+    enc->tokenizer = qwen3_tokenizer_load_dir(model_dir);
     if (!enc->tokenizer) {
         fprintf(stderr, "qwen3_encoder_load: failed to load tokenizer\n");
         free(enc);
@@ -2100,7 +2109,7 @@ qwen3_encoder_t *qwen3_encoder_load(const char *model_dir, int use_mmap) {
     }
 
     /* Load model - use mmap mode if requested (saves ~14GB RAM) */
-#ifdef QWEN3_DEV
+#if defined(QWEN3_DEV) && !defined(USE_METAL)
     /* The GPU path uploads the bf16 weights straight from the mapped files. */
     if (iris_dev_available()) use_mmap = 1;
 #endif
@@ -2142,6 +2151,7 @@ void qwen3_set_extraction_mode(qwen3_encoder_t *enc, int mode) {
     case QWEN3_EXTRACT_QIMAGE:  /* last layer, before the final norm */
         layers[0] = model->num_layers - 1;
         model->num_out_layers = 1;
+        model->max_seq_len = QWEN3_QIMAGE_MAX_SEQ_LEN;
         break;
     default:                    /* hidden_states[9, 18, 27] */
         layers[0] = 8;
@@ -2233,6 +2243,18 @@ float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
     if (!tokens) return NULL;
     return qwen3_encode_tokens(enc, tokens, num_tokens, num_system,
                                out_num_tokens, out_seq_len);
+}
+
+int qwen3_count_images(const char *model_dir, const char *prompt, const int *slots, int n) {
+    qwen3_tokenizer_t *tok = qwen3_tokenizer_load_dir(model_dir);
+    int *rows = malloc(n * sizeof(int));
+    int num_tokens = 0, num_system;
+    if (tok && rows)
+        free(qwen3_tokenize_chat_images(tok, QWEN3_QIMAGE_SYSTEM, prompt, slots, n,
+                                        &num_tokens, &num_system, rows));
+    free(rows);
+    if (tok) qwen3_tokenizer_free(tok);
+    return num_tokens;
 }
 
 float *qwen3_encode_images(qwen3_encoder_t *enc, const char *prompt,

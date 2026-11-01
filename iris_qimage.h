@@ -72,6 +72,10 @@ typedef struct iris_transformer_qimage iris_transformer_qimage_t;
 iris_transformer_qimage_t *iris_transformer_load_qimage(const char *model_dir);
 void iris_transformer_free_qimage(iris_transformer_qimage_t *tf);
 
+/* Estimated peak memory of a prefill of rows prefix tokens, with the weights
+ * if weights is set, from the config alone. On a GPU it is device memory. */
+size_t iris_transformer_memory_qimage(const char *model_dir, int rows, int weights);
+
 /* Latent channels the transformer reads and predicts (64). */
 int iris_transformer_channels_qimage(const iris_transformer_qimage_t *tf);
 

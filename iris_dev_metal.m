@@ -16,12 +16,14 @@
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 #include "iris_dev.h"
+#include <mach/mach.h>
 #include <stdio.h>
 #include <string.h>
 
 #define EW_THREADS 256
 #define ROW_THREADS 256
 #define CONV_SCRATCH ((size_t)256 << 20)   /* im2col buffer budget (bytes) */
+#define ATTN_MAX_SCORES ((size_t)1 << 31)  /* Scores of one SDPA graph */
 #define GN_BLOCKS 64
 /* A command buffer holds 32 residency sets and a graph takes about two of
  * them (measured: 24 graphs overflow, 16 fit). */
@@ -467,6 +469,19 @@ static id<MTLBuffer> find_buffer(const void *p, NSUInteger *offset) {
     return b;
 }
 
+/* The GPU's working set budget, capped by what the system can give without
+ * paging: free pages and those it can drop (the file cache holds the weights). */
+size_t iris_dev_memory(void) {
+    size_t budget = g_device.recommendedMaxWorkingSetSize - g_device.currentAllocatedSize;
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &count) !=
+        KERN_SUCCESS) return budget;
+    size_t system = (size_t)(vm.free_count + vm.external_page_count + vm.purgeable_count) *
+                    vm_page_size;
+    return system < budget ? system : budget;
+}
+
 void *iris_dev_alloc(size_t bytes) {
     @autoreleasepool {
         id<MTLBuffer> b = [g_device newBufferWithLength:(bytes ? bytes : 16)
@@ -839,21 +854,29 @@ void iris_dev_linear_bf16(uint16_t *y, const uint16_t *x, const uint16_t *W, int
     linear(y, MPSDataTypeBFloat16, x, W, rows, in, out);
 }
 
-static IrisDevGraph *sdpa_graph(int seq_q, int seq_k, int heads, int head_dim, float scale,
-                                int masked, int causal) {
-    NSString *key = [NSString stringWithFormat:@"sdpa %d %d %d %d %a %d %d", seq_q, seq_k, heads,
-                                               head_dim, scale, masked, causal];
+static IrisDevGraph *sdpa_graph(int seq_q, int seq_k, int heads, int kv_heads, int head_dim,
+                                float scale, int masked, int causal) {
+    NSString *key = [NSString stringWithFormat:@"sdpa %d %d %d %d %d %a %d %d", seq_q, seq_k,
+                                               heads, kv_heads, head_dim, scale, masked, causal];
     IrisDevGraph *g = g_graphs[key];
     if (g) return g;
     g = [IrisDevGraph new];
     g.graph = [MPSGraph new];
-    NSArray *qs = @[@1, @(seq_q), @(heads), @(head_dim)], *ks = @[@1, @(seq_k), @(heads), @(head_dim)];
+    NSArray *qs = @[@1, @(seq_q), @(heads), @(head_dim)];
+    NSArray *ks = @[@1, @(seq_k), @(kv_heads), @(head_dim)];
     MPSGraphTensor *q = [g.graph placeholderWithShape:qs dataType:MPSDataTypeBFloat16 name:nil];
     MPSGraphTensor *k = [g.graph placeholderWithShape:ks dataType:MPSDataTypeBFloat16 name:nil];
     MPSGraphTensor *v = [g.graph placeholderWithShape:ks dataType:MPSDataTypeBFloat16 name:nil];
     MPSGraphTensor *qt = [g.graph transposeTensor:q dimension:1 withDimension:2 name:nil];
     MPSGraphTensor *kt = [g.graph transposeTensor:k dimension:1 withDimension:2 name:nil];
     MPSGraphTensor *vt = [g.graph transposeTensor:v dimension:1 withDimension:2 name:nil];
+    if (kv_heads != heads) {
+        /* GQA: the query heads of a kv head broadcast against it. */
+        qt = [g.graph reshapeTensor:qt withShape:@[@(kv_heads), @(heads / kv_heads), @(seq_q),
+                                                   @(head_dim)] name:nil];
+        kt = [g.graph reshapeTensor:kt withShape:@[@(kv_heads), @1, @(seq_k), @(head_dim)] name:nil];
+        vt = [g.graph reshapeTensor:vt withShape:@[@(kv_heads), @1, @(seq_k), @(head_dim)] name:nil];
+    }
     NSMutableArray *inputs = [NSMutableArray arrayWithObjects:q, k, v, nil];
     NSMutableArray *shapes = [NSMutableArray arrayWithObjects:qs, ks, ks, nil];
     MPSGraphTensor *mask = nil;
@@ -864,13 +887,21 @@ static IrisDevGraph *sdpa_graph(int seq_q, int seq_k, int heads, int head_dim, f
         [shapes addObject:ms];
     }
     if (causal) {
-        /* Additive bias: -inf (bf16) where query i meets key j >= i + causal. */
-        NSMutableData *tri = [NSMutableData dataWithLength:(size_t)seq_q * seq_k * sizeof(uint16_t)];
-        uint16_t *b = tri.mutableBytes;
-        for (int i = 0; i < seq_q; i++)
-            for (int j = i + causal; j < seq_k; j++) b[(size_t)i * seq_k + j] = 0xFF80;
-        MPSGraphTensor *t = [g.graph constantWithData:tri shape:@[@1, @1, @(seq_q), @(seq_k)]
-                                             dataType:MPSDataTypeBFloat16];
+        /* Additive bias: -inf where query i meets key j >= i + causal. Computed in
+         * the graph: as a constant it would stay in memory with every graph. */
+        MPSGraphTensor *i = [g.graph coordinateAlongAxis:2 withShape:@[@1, @1, @(seq_q), @1] name:nil];
+        MPSGraphTensor *j = [g.graph coordinateAlongAxis:3 withShape:@[@1, @1, @1, @(seq_k)] name:nil];
+        MPSGraphTensor *n = [g.graph constantWithScalar:causal dataType:MPSDataTypeInt32];
+        MPSGraphTensor *end = [g.graph additionWithPrimaryTensor:i secondaryTensor:n name:nil];
+        static const uint16_t neg_inf = 0xFF80;
+        MPSGraphTensor *hide = [g.graph constantWithData:[NSData dataWithBytes:&neg_inf length:2]
+                                                   shape:@[@1] dataType:MPSDataTypeBFloat16];
+        MPSGraphTensor *t = [g.graph
+            selectWithPredicateTensor:[g.graph greaterThanOrEqualToWithPrimaryTensor:j
+                                                                     secondaryTensor:end name:nil]
+                  truePredicateTensor:hide
+                 falsePredicateTensor:[g.graph constantWithScalar:0 dataType:MPSDataTypeBFloat16]
+                                 name:nil];
         mask = mask ? [g.graph additionWithPrimaryTensor:mask secondaryTensor:t name:nil] : t;
     }
     MPSGraphTensor *o;
@@ -880,6 +911,8 @@ static IrisDevGraph *sdpa_graph(int seq_q, int seq_k, int heads, int head_dim, f
     else
         o = [g.graph scaledDotProductAttentionWithQueryTensor:qt keyTensor:kt valueTensor:vt
                                                         scale:scale name:nil];
+    if (kv_heads != heads)
+        o = [g.graph reshapeTensor:o withShape:@[@1, @(heads), @(seq_q), @(head_dim)] name:nil];
     o = [g.graph transposeTensor:o dimension:1 withDimension:2 name:nil];
     g.inputs = inputs;
     g.shapes = shapes;
@@ -892,19 +925,17 @@ static IrisDevGraph *sdpa_graph(int seq_q, int seq_k, int heads, int head_dim, f
 
 /* Attention through MPSGraph's fused SDPA, on contiguous copies of q, k, v
  * when they are strided views; the key mask and the causal triangle become
- * an additive bias. Supports one kv head per query head. */
+ * an additive bias. Queries run in chunks of at most ATTN_MAX_SCORES scores,
+ * so a long sequence does not need all its scores in memory at once. */
 void iris_dev_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_t *k,
                         const uint16_t *v, int ldi, int seq_q, int seq_k, int heads,
                         int kv_heads, int head_dim, float scale, int causal,
                         const int *key_mask) {
-    if (kv_heads != heads) {
-        fprintf(stderr, "iris_dev: Metal attention needs one kv head per query head\n");
-        return;
-    }
     @autoreleasepool {
-        int dim = heads * head_dim;
+        int dim = heads * head_dim, kv_dim = kv_heads * head_dim;
         int strided = ldi != dim, out_strided = ldo != dim;
-        size_t need = (size_t)(strided ? seq_q + 2 * seq_k : 0) * dim +
+        size_t need = (size_t)(strided ? seq_q : 0) * dim +
+                      (size_t)(strided ? 2 * seq_k : 0) * kv_dim +
                       (size_t)(out_strided ? seq_q : 0) * dim + (key_mask ? seq_k : 0);
         if (need > g_attn_scratch_elems) {
             iris_dev_free(g_attn_scratch);
@@ -915,30 +946,37 @@ void iris_dev_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_
         uint16_t *s = g_attn_scratch;
         const uint16_t *qc = q, *kc = k, *vc = v;
         if (strided) {
-            uint16_t *qs = s, *ks = qs + (size_t)seq_q * dim, *vs = ks + (size_t)seq_k * dim;
+            uint16_t *qs = s, *ks = qs + (size_t)seq_q * dim, *vs = ks + (size_t)seq_k * kv_dim;
             copy_2d(qs, dim, q, ldi, seq_q, dim);
-            copy_2d(ks, dim, k, ldi, seq_k, dim);
-            copy_2d(vs, dim, v, ldi, seq_k, dim);
+            copy_2d(ks, kv_dim, k, ldi, seq_k, kv_dim);
+            copy_2d(vs, kv_dim, v, ldi, seq_k, kv_dim);
             qc = qs;
             kc = ks;
             vc = vs;
-            s = vs + (size_t)seq_k * dim;
+            s = vs + (size_t)seq_k * kv_dim;
         }
         uint16_t *oc = out_strided ? s : out;
         if (out_strided) s += (size_t)seq_q * dim;
-        NSMutableArray *ptrs = [NSMutableArray arrayWithObjects:[NSValue valueWithPointer:qc],
-                                [NSValue valueWithPointer:kc], [NSValue valueWithPointer:vc], nil];
         if (key_mask) {
             id<MTLComputeCommandEncoder> e = begin(p_key_mask_bias);
             arg_ptr(e, s, 0);
             arg_ptr(e, key_mask, 1);
             arg_ulong(e, seq_k, 2);
             end_elementwise(e, seq_k);
-            [ptrs addObject:[NSValue valueWithPointer:s]];
         }
-        IrisDevGraph *g = sdpa_graph(seq_q, seq_k, heads, head_dim, scale, key_mask != NULL,
-                                     causal);
-        run_graph(g, ptrs, oc);
+        int chunk = (int)(ATTN_MAX_SCORES / ((size_t)heads * seq_k));
+        if (chunk < 1) chunk = 1;
+        for (int q0 = 0; q0 < seq_q; q0 += chunk) {
+            int nq = seq_q - q0 < chunk ? seq_q - q0 : chunk;
+            int keys = causal && q0 + nq - 1 + causal < seq_k ? q0 + nq - 1 + causal : seq_k;
+            NSMutableArray *ptrs = [NSMutableArray arrayWithObjects:
+                                    [NSValue valueWithPointer:qc + (size_t)q0 * dim],
+                                    [NSValue valueWithPointer:kc], [NSValue valueWithPointer:vc], nil];
+            if (key_mask) [ptrs addObject:[NSValue valueWithPointer:s]];
+            IrisDevGraph *g = sdpa_graph(nq, keys, heads, kv_heads, head_dim, scale,
+                                         key_mask != NULL, causal ? causal + q0 : 0);
+            run_graph(g, ptrs, oc + (size_t)q0 * dim);
+        }
         if (out_strided) copy_2d(out, ldo, oc, dim, seq_q, dim);
     }
 }

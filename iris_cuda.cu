@@ -172,6 +172,12 @@ extern "C" void iris_dev_cleanup(void) {
     g_ready = 0;
 }
 
+extern "C" size_t iris_dev_memory(void) {
+    size_t avail = 0, total = 0;
+    GPU(MemGetInfo)(&avail, &total);
+    return avail;
+}
+
 extern "C" void *iris_dev_alloc(size_t bytes) {
     void *p = NULL;
     if (GPU(Malloc)(&p, bytes ? bytes : 1) != GPU(Success)) return NULL;

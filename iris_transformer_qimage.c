@@ -1211,24 +1211,31 @@ static int open_shards(iris_transformer_qimage_t *tf, const char *model_dir) {
     return tf->num_sf;
 }
 
+static int read_config(const char *model_dir, char *cfg, size_t size) {
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/transformer/config.json", model_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "Qwen-Image: missing %s\n", path);
+        return 0;
+    }
+    size_t n = fread(cfg, 1, size - 1, f);
+    cfg[n] = '\0';
+    fclose(f);
+    return 1;
+}
+
 /* Load the transformer from <model_dir>/transformer. Weights are not
  * copied: they are used straight from the mmapped safetensors shards. */
 iris_transformer_qimage_t *iris_transformer_load_qimage(const char *model_dir) {
     iris_transformer_qimage_t *tf = calloc(1, sizeof(*tf));
     if (!tf) return NULL;
 
-    char path[4096];
-    snprintf(path, sizeof(path), "%s/transformer/config.json", model_dir);
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        fprintf(stderr, "Qwen-Image: missing %s\n", path);
+    char cfg[8192];
+    if (!read_config(model_dir, cfg, sizeof(cfg))) {
         free(tf);
         return NULL;
     }
-    char cfg[8192];
-    size_t n = fread(cfg, 1, sizeof(cfg) - 1, f);
-    cfg[n] = '\0';
-    fclose(f);
 
     tf->heads = (int)config_num(cfg, "num_attention_heads", 32);
     tf->head_dim = (int)config_num(cfg, "attention_head_dim", 128);
@@ -1291,6 +1298,25 @@ iris_transformer_qimage_t *iris_transformer_load_qimage(const char *model_dir) {
 error:
     iris_transformer_free_qimage(tf);
     return NULL;
+}
+
+size_t iris_transformer_memory_qimage(const char *model_dir, int rows, int weights) {
+    char cfg[8192];
+    if (!read_config(model_dir, cfg, sizeof(cfg))) return 0;
+    size_t dim = (size_t)config_num(cfg, "num_attention_heads", 32) *
+                 (size_t)config_num(cfg, "attention_head_dim", 128);
+    size_t mlp = dim * (size_t)config_num(cfg, "mlp_ratio", 3);
+    size_t layers = (size_t)config_num(cfg, "num_layers", 32);
+    size_t kv_bytes = 4;
+#ifdef IRIS_DEV
+    if (iris_dev_available()) kv_bytes = 2;
+#endif
+    /* Each row: its keys and values in every block, one block's activations
+     * (dev_ensure) and its keys and values in the attention scratch. On top,
+     * what the graphs of one attention hold, measured at 10 references. */
+    size_t row = layers * 2 * dim * kv_bytes + 18 * dim + 6 * mlp + 4 * dim;
+    return row * rows + ((size_t)6 << 30) +
+           (weights ? layers * (4 * dim * dim + 3 * mlp * dim) * 2 : 0);
 }
 
 void iris_transformer_free_qimage(iris_transformer_qimage_t *tf) {

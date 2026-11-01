@@ -141,6 +141,23 @@ QIMAGE_TESTS = [
         "reference": "test_vectors/reference_qimage_turbo_edit_8step_512x512_seed42.png",
         "mean_diff_threshold": 0.8,
     },
+    {
+        # 2100 encoder tokens, past the native Metal kernels. Correct output on
+        # Metal measures 1.86. Failing it: no position advance after the second
+        # reference 9.4 (transformer) and 13 (encoder), no deepstack on the device
+        # path 12, wrong reference frame 27, device encoder not causal or with
+        # the wrong GQA groups 95.
+        "name": "Qwen-Image 2.1 Turbo two references test (8 steps, 256x256)",
+        "prompt": "The woman from the first image holds the cat from the second image",
+        "seed": 42,
+        "steps": 8,
+        "width": 256,
+        "height": 256,
+        "inputs": ["test_vectors/qimage_edit_input_384x512.png",
+                   "test_vectors/img2img_input_256x256.png"],
+        "reference": "test_vectors/reference_qimage_turbo_tworef_8step_256x256_seed42.png",
+        "mean_diff_threshold": 3,
+    },
 ]
 
 
@@ -218,9 +235,9 @@ def run_test(binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
         "-o", output_path,
     ]
 
-    # Add input image for img2img tests
-    if "input" in test:
-        cmd.extend(["-i", test["input"]])
+    # Add input images for img2img tests
+    for path in test.get("inputs", [test["input"]] if "input" in test else []):
+        cmd.extend(["-i", path])
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)

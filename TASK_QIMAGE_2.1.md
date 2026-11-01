@@ -2,8 +2,9 @@
 
 Status: text-to-image implemented and verified on the real weights on MPS,
 CUDA and BLAS (see "Measured on the real weights"). ROCm has never been
-compiled. Phase 2 (reference images) is planned below, not started. Delete
-this file when the work is merged.
+compiled. Phase 2 (reference images, any number up to memory) is implemented on
+MPS and BLAS, on CUDA it is not yet compiled. Delete this file when the work is
+merged.
 
 ## Implementation status
 
@@ -287,7 +288,7 @@ positions, so the old `seq_len <= 512` concern is gone.
   against `drop_idx.txt`. Everything after it is kept, including the trailing
   `<|im_start|>assistant\n` tokens.
 - An empty prompt becomes `" "`.
-- **Truncation**: upstream never truncates. iris must cap at 1280 tokens.
+- **Truncation**: upstream never truncates. iris must cap at 17280 tokens.
   Truncate the prompt body, not the tail, so the template suffix survives, and
   warn as the tokenizer already does since d3c1060.
 - **Padding**: pad to a multiple of `QWEN3_FLUX3_PAD_MULTIPLE` (80) as FLUX.3
@@ -585,7 +586,7 @@ clamp to [-1, 1]
 | Tensor names in the VAE/transformer headers differ from the module tree | Dump the safetensors headers in M0 before writing loaders |
 | Cache-on vs cache-off rounding confuses parity | Reference always runs `use_kv_cache=True` in float32 |
 | VAE memory at 2K+ | Separate size cap; tiling stays out of scope |
-| Prompts over 1280 tokens | Truncate the body, keep the template tail, warn |
+| Prompts over 17280 tokens | Truncate the body, keep the template tail, warn |
 | Metal `iris_dev_copy_2d` forcing syncs | Blit in the current command buffer, never a host memcpy |
 
 ## Phase 2: reference images and editing (separate task)
@@ -633,11 +634,9 @@ executed.
 
 ### Gaps the plan must cover
 
-- **1280 token limit**: a 1024x1024 reference takes 1024 encoder tokens, leaving
-  228 for the prompt, and two references do not fit. Limits are the Metal
-  threadgroup arrays, `attn_scores` (`heads*seq^2`, int overflow above about 8191)
-  and the static work buffers. This is M8.
-- `QWEN3_DEV` is off on Metal, and Metal attention refuses GQA.
+- **1280 token limit** (done, M8): sequences past the Metal threadgroup arrays go
+  through `qwen3_forward_dev`, `attn_scores` holds one head, work buffers follow
+  the real sequence. The limit is now 17280 tokens, 16 references and a prompt.
 - `iris_dev_head_norm_rope` cannot serve the vision tower: it normalizes and needs
   a power-of-two thread count.
 - `iris_image_convert` mishandles 2-channel input, `iris_image_resize` has no
@@ -659,10 +658,11 @@ Each reads Python dumps, so stages are tested alone. Ship one reference first.
 | M5 | Vision tower, GPU (`iris_dev_rope`, `iris_dev_gelu_tanh`) | bf16 tolerance |
 | M6 | Text encoder with images, up to 1280 tokens | tokens, positions, layers, `emb.bin` non-slot rows |
 | M7 | End to end, one reference | final latent and image match, Turbo and base |
-| M8 | Long sequences, 2+ references | 2-ref `emb.bin` match, 10-ref memory run |
+| M8 | Long sequences, 2+ references, done | 2-ref `emb.bin` match, 10-ref memory run |
 
-GPU memory at 1 MP: about 17 GB peak for one reference, 42 GB for ten (prefix K/V
-2.2 and 21.5 GB). Skipped: CFG with references, VAE tiling.
+GPU memory at 1 MP, peak on Metal: about 24 GB for one
+reference, 51 GB for ten (prefix K/V 2.2 and 21.5 GB). Skipped: CFG with
+references, VAE tiling.
 
 ## Licence
 
