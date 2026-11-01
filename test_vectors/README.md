@@ -38,14 +38,15 @@ python debug/qimage_reference.py -d qwen-image-2.1-turbo -W 256 -H 256 \
 
 ## reference_qimage_turbo_edit_8step_512x512_seed42.png
 
-Qwen-Image 2.1 Turbo with the reference image `img2img_input_256x256.png`, from
-the official pipeline in float32, starting from the noise iris generates for
+Qwen-Image 2.1 Turbo with the reference image `qimage_edit_input_384x512.png`, a
+portrait crop of `images/woman_with_sunglasses.png`: a photo, so the vision tower
+matters, and not square, so its height and width axes do. From the official pipeline in float32, starting from the noise iris generates for
 seed 42:
 ```bash
 dump_noise 64 32 32 42 noise.bin
 python debug/qimage_reference.py -d qwen-image-2.1-turbo -W 512 -H 512 \
-    -p "Turn the cat into a watercolor painting" --noise noise.bin \
-    --image test_vectors/img2img_input_256x256.png -o ref
+    -p "Same woman, same pose, as a watercolor painting" --noise noise.bin \
+    --image test_vectors/qimage_edit_input_384x512.png -o ref
 ```
 
 ## Verification

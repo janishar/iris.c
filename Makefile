@@ -232,7 +232,7 @@ iris_sample.o: iris_sample.c iris.h iris_kernels.h iris_qimage.h
 iris_image.o: iris_image.c iris.h
 iris_safetensors.o: iris_safetensors.c iris_safetensors.h
 iris_qwen3.o: iris_qwen3.c iris_qwen3.h iris_safetensors.h
-iris_qwen3_tokenizer.o: iris_qwen3_tokenizer.c iris_qwen3.h
+iris_qwen3_tokenizer.o: iris_qwen3_tokenizer.c iris_qwen3.h iris_nfc_table.h
 terminals.o: terminals.c terminals.h iris.h
 iris_cli.o: iris_cli.c iris_cli.h iris.h iris_qwen3.h embcache.h linenoise.h terminals.h
 linenoise.o: linenoise.c linenoise.h

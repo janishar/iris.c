@@ -97,6 +97,8 @@ struct qwen3_model {
     int vocab_size;
     float rope_theta;
     int extraction_mode;      /* QWEN3_EXTRACT_* */
+    int out_layers[QWEN3_MAX_OUTPUT_LAYERS];  /* 0-based layers forming the embeddings */
+    int num_out_layers;
     int max_seq_len;          /* QWEN3_MAX_SEQ_LEN, QWEN3_VL_MAX_SEQ_LEN for Qwen3-VL */
     char prefix[32];          /* Tensor names: "model." or "model.language_model." */
 
@@ -133,7 +135,7 @@ struct qwen3_model {
     float *mlp_out;           /* [seq_len, hidden] */
     float *norm_buf;          /* [seq_len, hidden] */
 
-    /* Outputs of the extracted layers, see qwen3_output_layers() */
+    /* Outputs of out_layers */
     float *layer_outputs[QWEN3_MAX_OUTPUT_LAYERS];  /* [seq_len, hidden] each */
 
     /* Pre-allocated attention work buffers (avoid per-call allocation) */
@@ -325,31 +327,6 @@ static void qwen3_add_deepstack(const qwen3_model_t *model, float *x, int k) {
         float *row = x + model->image_rows[i] * hidden;
         size_t n = (size_t)img->h * img->w * hidden;
         for (size_t j = 0; j < n; j++) row[j] += img->deep[k][j];
-    }
-}
-
-/* Fill layers[] with the 0-based indices of the layers whose outputs are
- * concatenated into the embeddings, and return how many there are.
- * Python hidden_states[i] is the output after layer i-1. */
-static int qwen3_output_layers(const qwen3_model_t *model, int *layers) {
-    switch (model->extraction_mode) {
-    case QWEN3_EXTRACT_ZIMAGE:  /* hidden_states[-2] */
-        layers[0] = model->num_layers - 2;
-        return 1;
-    case QWEN3_EXTRACT_FLUX3:   /* hidden_states[4, 8, ..., 32] */
-        for (int i = 0; i < 8; i++) layers[i] = 4 * (i + 1) - 1;
-        return 8;
-    case QWEN3_EXTRACT_QIMAGE:  /* last layer, before the final norm */
-#ifdef QWEN3_QIMAGE_OUTPUTS     /* debug/dump_qimage_text.c */
-        return QWEN3_QIMAGE_OUTPUTS(model, layers);
-#endif
-        layers[0] = model->num_layers - 1;
-        return 1;
-    default:                    /* hidden_states[9, 18, 27] */
-        layers[0] = 8;
-        layers[1] = 17;
-        layers[2] = 26;
-        return 3;
     }
 }
 
@@ -1002,8 +979,8 @@ static iris_gpu_tensor_t qwen3_mlp_gpu(qwen3_model_t *model, qwen3_layer_t *laye
  * loaded from mmap on demand and freed after each layer. */
 static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *attention_mask) {
     int hidden = model->hidden_size;
-    int out_layers[QWEN3_MAX_OUTPUT_LAYERS];
-    int num_saved = qwen3_output_layers(model, out_layers);
+    const int *out_layers = model->out_layers;
+    int num_saved = model->num_out_layers;
     int last_layer = out_layers[num_saved - 1];
 
     /* Upload hidden state to GPU as bf16 */
@@ -1153,15 +1130,15 @@ static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *atten
 
 /* Main Qwen3 forward pass. Runs embedding lookup then processes through
  * transformer layers, saving the hidden states of the layers selected by
- * the extraction mode (see qwen3_output_layers()) and concatenating them
+ * the extraction mode (see qwen3_set_extraction_mode()) and concatenating them
  * -> [seq, n*hidden]. Stops early at the last needed extraction layer to
  * skip unnecessary layers of compute. Tries fully GPU-resident path first,
  * falls back to mixed CPU/GPU or pure CPU. */
 float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
                      const int *attention_mask, int seq_len) {
     int hidden = model->hidden_size;
-    int out_layers[QWEN3_MAX_OUTPUT_LAYERS];
-    int num_out = qwen3_output_layers(model, out_layers);
+    const int *out_layers = model->out_layers;
+    int num_out = model->num_out_layers;
     int last_layer = out_layers[num_out - 1];
     float *output;
 
@@ -2149,7 +2126,29 @@ qwen3_encoder_t *qwen3_encoder_load(const char *model_dir, int use_mmap) {
  * before encoding. */
 void qwen3_set_extraction_mode(qwen3_encoder_t *enc, int mode) {
     if (!enc || !enc->model) return;
-    enc->model->extraction_mode = mode;
+    qwen3_model_t *model = enc->model;
+    int *layers = model->out_layers;
+    model->extraction_mode = mode;
+    /* Python hidden_states[i] is the output after layer i-1. */
+    switch (mode) {
+    case QWEN3_EXTRACT_ZIMAGE:  /* hidden_states[-2] */
+        layers[0] = model->num_layers - 2;
+        model->num_out_layers = 1;
+        break;
+    case QWEN3_EXTRACT_FLUX3:   /* hidden_states[4, 8, ..., 32] */
+        for (int i = 0; i < 8; i++) layers[i] = 4 * (i + 1) - 1;
+        model->num_out_layers = 8;
+        break;
+    case QWEN3_EXTRACT_QIMAGE:  /* last layer, before the final norm */
+        layers[0] = model->num_layers - 1;
+        model->num_out_layers = 1;
+        break;
+    default:                    /* hidden_states[9, 18, 27] */
+        layers[0] = 8;
+        layers[1] = 17;
+        layers[2] = 26;
+        model->num_out_layers = 3;
+    }
 }
 
 void qwen3_encoder_free(qwen3_encoder_t *enc) {

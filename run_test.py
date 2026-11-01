@@ -115,9 +115,10 @@ FLUX3_TESTS = [
 # by debug/qimage_reference.py (official diffusers components, float32)
 # starting from the noise iris generates for seed 42. Correct txt2img output
 # measures a mean_diff of 0.6, a broken text prefix about 24. Correct edit
-# output on Metal measures 0.29; without the vision embeddings or the deepstack
-# features 0.97 to 0.99, without the reference tokens 27, with an unnormalized
-# encoder latent 34: a small input image leaves the vision tower little to add.
+# output on Metal measures 0.69. Failing it: no MRoPE 0.91, height and width
+# swapped 0.88, a wrong position advance 1.72, one deepstack layer of three 2.04,
+# wrong reference position in the transformer 35. Deepstack layers in the wrong
+# order give 0.72 and pass: only debug/dump_qimage_e2e.c on BLAS sees that.
 QIMAGE_TESTS = [
     {
         "name": "Qwen-Image 2.1 Turbo test (8 steps, 256x256)",
@@ -131,14 +132,14 @@ QIMAGE_TESTS = [
     },
     {
         "name": "Qwen-Image 2.1 Turbo edit test (8 steps, 512x512)",
-        "prompt": "Turn the cat into a watercolor painting",
+        "prompt": "Same woman, same pose, as a watercolor painting",
         "seed": 42,
         "steps": 8,
         "width": 512,
         "height": 512,
-        "input": "test_vectors/img2img_input_256x256.png",
+        "input": "test_vectors/qimage_edit_input_384x512.png",
         "reference": "test_vectors/reference_qimage_turbo_edit_8step_512x512_seed42.png",
-        "mean_diff_threshold": 0.6,
+        "mean_diff_threshold": 0.8,
     },
 ]
 

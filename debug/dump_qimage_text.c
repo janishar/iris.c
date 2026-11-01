@@ -4,8 +4,8 @@
  * dumped vision embeddings: tokens and positions exactly, then the outputs
  * of layers 0, 1, 2 and 35 and the final embeddings.
  *
- * This file includes iris_qwen3.c to reach its model and to select the
- * layers it returns, so link everything except that object.
+ * This file includes iris_qwen3.c to reach its model and to change the layers
+ * it returns, so link everything except that object.
  *
  * Build, in bash, after make blas:
  *   cc -O3 -march=native -ffast-math -DUSE_BLAS -DACCELERATE_NEW_LAPACK -I. \
@@ -31,21 +31,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int debug_layers;
-
-static int debug_outputs(int num_layers, int *layers) {
-    if (!debug_layers) {
-        layers[0] = num_layers - 1;
-        return 1;
-    }
-    layers[0] = 0;
-    layers[1] = 1;
-    layers[2] = 2;
-    layers[3] = num_layers - 1;
-    return 4;
-}
-
-#define QWEN3_QIMAGE_OUTPUTS(model, layers) debug_outputs((model)->num_layers, layers)
 #include "../iris_qwen3.c"
 #ifdef USE_METAL
 #include "iris_metal.h"
@@ -161,7 +146,9 @@ int main(int argc, char **argv) {
     /* Layers 0, 1, 2, 35. The stream holds deepstack k after layer k. */
     int pos[MAX_IMAGES], seq;
     size_t cells = (size_t)num_tokens * hidden;
-    debug_layers = 1;
+    for (int l = 0; l < 3; l++) model->out_layers[l] = l;
+    model->out_layers[3] = model->num_layers - 1;
+    model->num_out_layers = 4;
     float *emb = qwen3_encode_images(enc, prompt, images, n, &seq, pos);
     if (!emb) return 1;
     free(emb);
@@ -205,7 +192,7 @@ int main(int argc, char **argv) {
     free(s);
 
     /* The real output: text rows of emb.bin, block positions from the mask */
-    debug_layers = 0;
+    qwen3_set_extraction_mode(enc, QWEN3_EXTRACT_QIMAGE);
     emb = qwen3_encode_images(enc, prompt, images, n, &seq, pos);
     if (!emb) return 1;
     float *ref_emb = read_file("emb.bin", &bytes);

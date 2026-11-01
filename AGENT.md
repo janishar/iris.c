@@ -70,7 +70,8 @@ iris_qimage.h             - Qwen-Image internal API (scheduler, transformer, VAE
 iris_sample.c             - Sampling/denoising loops (Euler ODE)
 iris_qwen3.c              - Qwen3 text encoder
 iris_qwen3_vision.c       - Qwen3-VL vision tower (Qwen-Image references)
-iris_qwen3_tokenizer.c    - BPE tokenizer
+iris_qwen3_tokenizer.c    - BPE tokenizer (added tokens, NFC, Qwen2 pre-tokenizer)
+iris_nfc_table.h          - Unicode tables for NFC, from debug/gen_nfc_table.py
 iris_vae.c                - VAE encoder/decoder
 iris_kernels.c            - CPU kernels (softmax, RMSNorm, etc.)
 iris_metal.m              - Metal GPU acceleration runtime
@@ -474,6 +475,8 @@ axes_dims_rope=[32,32,32,32], rope_theta=10000, flow_map=true (distilled).
    The pre-tokenizer must follow the Qwen2 split regex exactly (all models):
    a simplified split gave different tokens for hyphenated words, quotes,
    punctuation before newlines, repeated spaces, and changed the images.
+   Before it, added tokens split the text (even inside a prompt) and the pieces
+   go through the tokenizer's NFC normalizer.
 2. **GPU attention threadgroup size**: the causal attention kernels use tree
    reductions that need a power-of-two thread count. Flux/Z-Image always used
    512 tokens; Flux3 windows (80, 160, ...) exposed the bug.
@@ -539,7 +542,10 @@ With references (qwen3_encode_images):
 - Slot rows are not returned: the transformer fills them with latents, and
   iris_qimage_ref_t.pos counts the text rows before each block.
 - Reference pipeline (iris_generate_refs_qimage): prepare, VAE encode, vision
-  tower, text, each freed before the next. Without -W -H the target follows the
+  tower, text, each freed before the next. A transformer left by the previous
+  generation is freed first: beside all three the REPL peaks at 41 GB instead of
+  29 GB, and reloading it costs under 2 s. Text-only generations keep it. Without
+  -W -H the target follows the
   LAST reference at 1024x1024 area (FLUX.3 follows the first), and -W -H never
   change the reference size.
 

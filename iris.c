@@ -1450,6 +1450,10 @@ iris_image *iris_generate_refs_qimage(iris_ctx *ctx, const char *prompt,
         goto done;
     }
 
+    /* A previous generation's transformer would sit beside all three encoders. */
+    iris_transformer_free_qimage(ctx->qimage_transformer);
+    ctx->qimage_transformer = NULL;
+
     if (!iris_encode_refs_qimage(ctx, rgba, ref, n)) {
         set_error("Failed to encode a reference image");
         goto done;
