@@ -115,10 +115,12 @@ FLUX3_TESTS = [
 # by debug/qimage_reference.py (official diffusers components, float32)
 # starting from the noise iris generates for seed 42. Correct txt2img output
 # measures a mean_diff of 0.6, a broken text prefix about 24. Correct edit
-# output on Metal measures 0.69. Failing it: no MRoPE 0.91, height and width
-# swapped 0.88, a wrong position advance 1.72, one deepstack layer of three 2.04,
-# wrong reference position in the transformer 35. Deepstack layers in the wrong
-# order give 0.72 and pass: only debug/dump_qimage_e2e.c on BLAS sees that.
+# output measures 0.72 on both backends, and 1e-5 of noise moves it 0.58-0.84.
+# Failing it: a wrong position advance 1.72, one deepstack layer of three 2.04,
+# wrong reference position in the transformer 35. No MRoPE (0.83-0.96) and height
+# and width swapped (0.78-1.03) overlap correct output, no threshold splits them:
+# debug/dump_qimage_text.c sees both as different positions. Deepstack layers in
+# the wrong order give 0.72 and pass: only debug/dump_qimage_e2e.c on BLAS sees that.
 QIMAGE_TESTS = [
     {
         "name": "Qwen-Image 2.1 Turbo test (8 steps, 256x256)",
@@ -139,16 +141,18 @@ QIMAGE_TESTS = [
         "height": 512,
         "input": "test_vectors/qimage_edit_input_384x512.png",
         "reference": "test_vectors/reference_qimage_turbo_edit_8step_512x512_seed42.png",
-        "mean_diff_threshold": 0.8,
+        "mean_diff_threshold": 1,
     },
     {
         # 2100 encoder tokens, past the native Metal kernels. Correct output
         # measures 1.86 on Metal and 3.42 on CUDA, and two references make the
-        # result depend on the rounding: changing the noise by 1e-5 gives 1.5-2.6
-        # on Metal and 1.3-5.2 on CUDA with the same per-step error. Failing it: no position advance after the second
-        # reference 9.4 (transformer) and 13 (encoder), no deepstack on the device
-        # path 12, wrong reference frame 27, device encoder not causal or with
-        # the wrong GQA groups 95.
+        # result depend on the rounding: changing the noise by 1e-5 gives 1.4-2.6
+        # on Metal and 1.3-5.3 on CUDA with the same per-step error.
+        # Failing it: no position advance after the second reference 9.4
+        # (transformer) and 13 (encoder), no deepstack on the device path 12,
+        # wrong reference frame 27, device encoder not causal or with the wrong
+        # GQA groups 95. Exact GELU in the vision blocks gives 5.95 and passes:
+        # debug/dump_qimage_vision.c sees that.
         "name": "Qwen-Image 2.1 Turbo two references test (8 steps, 256x256)",
         "prompt": "The woman from the first image holds the cat from the second image",
         "seed": 42,

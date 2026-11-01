@@ -1187,7 +1187,7 @@ float *iris_vae_encode_qimage(iris_vae_qimage_t *vae, const float *rgba, int h, 
 
 void iris_vae_release_qimage(iris_vae_qimage_t *vae) {
 #ifdef IRIS_DEV
-    if (vae->dec.dev) dv_free_buffers(vae->dec.dev);
+    dv_free(&vae->dec);
 #endif
     free_encoder(vae);
 }

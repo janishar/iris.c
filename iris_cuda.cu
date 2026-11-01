@@ -172,9 +172,15 @@ extern "C" void iris_dev_cleanup(void) {
 }
 
 extern "C" size_t iris_dev_memory(int held) {
-    (void)held;
     size_t avail = 0, total = 0;
     GPU(MemGetInfo)(&avail, &total);
+    if (!held) return avail;
+    /* The scratch buffers grow in place: a new run reuses them. */
+    avail += g_attn_scratch_size + g_gn_scratch_size * sizeof(float);
+    if (g_conv_scratch) avail += CONV_SCRATCH;
+#ifdef IRIS_HIP
+    avail += g_gemm_scratch_elems * sizeof(uint16_t);
+#endif
     return avail;
 }
 

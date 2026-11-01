@@ -790,6 +790,14 @@ static void iris_load_text_encoder_if_needed(iris_ctx *ctx) {
  * For Z-Image, takes hidden_states[-2] and reports the real (unpadded) token
  * count via out_seq_len. The returned embedding buffer is still max-seq padded;
  * Z-Image consumes only the first out_seq_len tokens. */
+/* Drop what a Qwen-Image run leaves on the device, so a stage that does not fit
+ * beside it gets the room of a first run. All of it reloads at the next use. */
+static void iris_unload_qimage(iris_ctx *ctx) {
+    iris_transformer_free_qimage(ctx->qimage_transformer);
+    ctx->qimage_transformer = NULL;
+    iris_vae_release_qimage(ctx->qimage_vae);
+}
+
 /* Memory a stage can use: device memory on a GPU (iris_dev_memory()), otherwise
  * most of the RAM. */
 static size_t iris_available_memory(int held) {
@@ -809,10 +817,8 @@ float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
 
     /* The encoder sits beside a previous generation's transformer if it fits. */
     if (ctx->qimage_transformer && !ctx->qwen3_encoder &&
-        qwen3_memory(ctx->model_dir, ctx->use_mmap) > iris_available_memory(0)) {
-        iris_transformer_free_qimage(ctx->qimage_transformer);
-        ctx->qimage_transformer = NULL;
-    }
+        qwen3_memory(ctx->model_dir, ctx->use_mmap) > iris_available_memory(0))
+        iris_unload_qimage(ctx);
 
     iris_load_text_encoder_if_needed(ctx);
     if (!ctx->qwen3_encoder) {
@@ -1388,9 +1394,8 @@ static int iris_fit_qimage(iris_ctx *ctx, int tokens, int rows, int text_rows, i
     if (text > need) need = text;
     if (decode > need) need = decode;
     size_t have = iris_available_memory(1);
-    if (need > have && ctx->qimage_transformer) {
-        iris_transformer_free_qimage(ctx->qimage_transformer);
-        ctx->qimage_transformer = NULL;
+    if (need > have) {
+        iris_unload_qimage(ctx);
         have = iris_available_memory(1);
     }
     if (need > have) {

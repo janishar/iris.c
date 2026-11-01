@@ -1309,8 +1309,8 @@ error:
 size_t iris_transformer_memory_qimage(const char *model_dir, int rows, int text_rows) {
     char cfg[8192];
     if (!read_config(model_dir, cfg, sizeof(cfg))) return 0;
-    size_t dim = (size_t)config_num(cfg, "num_attention_heads", 32) *
-                 (size_t)config_num(cfg, "attention_head_dim", 128);
+    size_t heads = (size_t)config_num(cfg, "num_attention_heads", 32);
+    size_t dim = heads * (size_t)config_num(cfg, "attention_head_dim", 128);
     size_t mlp = dim * (size_t)config_num(cfg, "mlp_ratio", 3);
     size_t layers = (size_t)config_num(cfg, "num_layers", 32);
     /* Each row: its keys and values in every block, one block's activations
@@ -1326,8 +1326,9 @@ size_t iris_transformer_memory_qimage(const char *model_dir, int rows, int text_
         fixed = QI_GRAPH_BYTES + layers * (4 * dim * dim + 3 * mlp * dim) * 2;
 #ifndef USE_METAL
         /* Causal text takes the GEMM attention: scores in f32 and bf16 for
-         * every head, up to ATTN_SCRATCH, and its input projections. */
-        size_t scores = (size_t)text_rows * text_rows * dim / 128 * 6;
+         * every head, up to ATTN_SCRATCH, and its input projections. The keys
+         * of text after a reference include the rows before it. */
+        size_t scores = (size_t)text_rows * rows * heads * 6;
         fixed += (scores < ATTN_SCRATCH ? scores : ATTN_SCRATCH) + (size_t)text_rows * dim * 6;
 #endif
     }

@@ -34,7 +34,8 @@ void iris_dev_cleanup(void);   /* Release the stream and BLAS handle */
 
 /* Memory */
 /* Bytes that can be allocated now; with held, for a run that takes the place
- * of what this process holds (Metal: its graphs stay and are reused). */
+ * of what this process holds (Metal: its graphs; CUDA: its scratch buffers).
+ * They stay and are reused. */
 size_t iris_dev_memory(int held);
 void *iris_dev_alloc(size_t bytes);       /* NULL on failure */
 void iris_dev_free(void *p);

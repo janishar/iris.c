@@ -584,11 +584,13 @@ With references (qwen3_encode_images):
   f32 with --no-mmap, twice that on Metal, whose cache copies them) and
   iris_vae_memory_qimage(). Available: iris_dev_memory(held = 1) (Metal: the
   working set budget, capped by free and file-backed pages and what the process
-  holds, since a new run replaces it; CUDA: free VRAM, after unloading the
-  transformer if that is short) or 90% of the RAM on the CPU. So a repeat is
-  judged like a first run. Every reference run is checked; a text-only run only
-  past 1280 tokens, so short prompts need no tokenizer and behave as before. The
-  figures were measured on all three, ROCm excepted.
+  holds, since a new run replaces it; CUDA: free VRAM plus the scratch buffers a
+  run reuses) or 90% of the RAM on the CPU. A run that is short unloads what the
+  last one left (iris_unload_qimage(): transformer, VAE activations and device
+  weights), so a repeat is judged like a first run. Every reference run is
+  checked; a text-only run only past 1280 tokens, so short prompts need no
+  tokenizer and behave as before. The figures were measured on all three, ROCm
+  excepted.
 - Prefix: released after sampling when it has references or is past 1280 tokens
   (iris_transformer_release_prefix_qimage()), so the decode and the next prompt
   do not sit beside gigabytes nothing will read. Short text-only prefixes stay
@@ -596,7 +598,7 @@ With references (qwen3_encode_images):
 - Decode: dv_buffers() asks iris_dev_memory() first, since Metal allocates past
   its budget. A decode that does not fit unloads the transformer.
 - Text-only: an encoder that does not fit beside the previous transformer
-  unloads it first (in iris_encode_text(), so the REPL does too).
+  unloads the same (in iris_encode_text(), so the REPL does too).
 - Metal with mapped weights cannot run the CPU encoder path, so past 1280 tokens
   without the device path the encoder fails with an error.
 - Measured on an M5 Pro with 64 GB, 8 Turbo steps at the default 1024x1024: 10

@@ -63,7 +63,9 @@ static int g_on_device = 0;
  * image_embeds (1024x1024); on the device upstream's bf16 tower is 5.1e-2 and
  * 1.6e-1 on image_embeds. Tighten them if the numbers improve, and treat a
  * stage going over as a bug. An error below the bf16 floor passes on the
- * device (tanh GELU in the mergers: 1.6e-3 on deep0); the CPU run catches it. */
+ * device (tanh GELU in the mergers: 1.6e-3 on deep0; exact GELU in the blocks,
+ * 3.3% on image_embeds against 2.4%). The CPU run catches the first,
+ * check_gelu() the second. */
 static const struct {
     const char *name;
     double cpu, device;
@@ -204,6 +206,25 @@ static void run_cpu(const qwen3_vision_t *v, const char *dir, const vis_input_t 
 }
 
 #ifdef IRIS_DEV
+/* The blocks' activation on the device against the CPU's, which the f32 stages
+ * pin. No rounding floor here: correct is 4.8e-7, exact GELU 4.7e-4. */
+static void check_gelu(void) {
+    enum { N = 1024 };
+    float host[N], dev[N];
+    double max_abs = 0;
+    for (int i = 0; i < N; i++) host[i] = -8.0f + 16.0f * i / (N - 1);
+    float *d = iris_dev_alloc(sizeof(host));
+    iris_dev_upload(d, host, sizeof(host));
+    iris_dev_gelu_tanh(d, N);
+    iris_dev_download(dev, d, sizeof(dev));
+    iris_dev_free(d);
+    iris_gelu_tanh(host, N);
+    for (int i = 0; i < N; i++)
+        if (fabs((double)dev[i] - host[i]) > max_abs) max_abs = fabs((double)dev[i] - host[i]);
+    printf("gelu_tanh max abs %.3e%s\n", max_abs, max_abs > 1e-5 ? "  OVER TOLERANCE" : "");
+    if (max_abs > 1e-5) g_failed = 1;
+}
+
 /* The same on the device. */
 static void run_dev(qwen3_vision_t *v, const char *dir, const vis_input_t *in,
                     size_t total, size_t row0) {
@@ -252,6 +273,7 @@ int main(int argc, char **argv) {
 #ifdef IRIS_DEV
     iris_dev_init();
     printf("device: %s\n", iris_dev_available() ? iris_dev_name() : "none");
+    if (iris_dev_available()) check_gelu();
 #endif
     qwen3_vision_t *v = qwen3_vision_load(argv[1]);
     if (!v) return 1;
