@@ -661,7 +661,8 @@ Each reads Python dumps, so stages are tested alone. Ship one reference first.
 | M8 | Long sequences, 2+ references, done | 2-ref `emb.bin` match, 10-ref memory run |
 
 GPU memory at 1 MP, peak on Metal: about 24 GB for one
-reference, 51 GB for ten (prefix K/V 2.2 and 21.5 GB). Skipped: CFG with
+reference, 48-51 GB for ten and up to 54 GB for eleven (prefix K/V 2.2 and 21.5 GB
+for one and ten). `iris_fit_qimage()` checks the largest stage before the first. Skipped: CFG with
 references, VAE tiling.
 
 ## Licence

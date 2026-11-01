@@ -1300,23 +1300,51 @@ error:
     return NULL;
 }
 
-size_t iris_transformer_memory_qimage(const char *model_dir, int rows, int weights) {
+#ifdef USE_METAL
+#define QI_GRAPH_BYTES ((size_t)6 << 30)
+#else
+#define QI_GRAPH_BYTES 0
+#endif
+
+size_t iris_transformer_memory_qimage(const char *model_dir, int rows) {
     char cfg[8192];
     if (!read_config(model_dir, cfg, sizeof(cfg))) return 0;
     size_t dim = (size_t)config_num(cfg, "num_attention_heads", 32) *
                  (size_t)config_num(cfg, "attention_head_dim", 128);
     size_t mlp = dim * (size_t)config_num(cfg, "mlp_ratio", 3);
     size_t layers = (size_t)config_num(cfg, "num_layers", 32);
-    size_t kv_bytes = 4;
-#ifdef IRIS_DEV
-    if (iris_dev_available()) kv_bytes = 2;
-#endif
     /* Each row: its keys and values in every block, one block's activations
-     * (dev_ensure) and its keys and values in the attention scratch. On top,
-     * what the graphs of one attention hold, measured at 10 references. */
+     * and its keys and values in the attention scratch. The rest is on a GPU
+     * the weights and, on Metal, what the graphs of one attention hold (10
+     * references, measured). On the CPU the weights are clean mapped pages,
+     * and the 2 GB are the stages' leftovers next to the prefix (r9). */
+    size_t kv_bytes = 4, fixed = (size_t)2 << 30;
+#ifdef IRIS_DEV
+    if (iris_dev_available()) {
+        kv_bytes = 2;
+        fixed = QI_GRAPH_BYTES + layers * (4 * dim * dim + 3 * mlp * dim) * 2;
+    }
+#endif
     size_t row = layers * 2 * dim * kv_bytes + 18 * dim + 6 * mlp + 4 * dim;
-    return row * rows + ((size_t)6 << 30) +
-           (weights ? layers * (4 * dim * dim + 3 * mlp * dim) * 2 : 0);
+    return row * rows + fixed;
+}
+
+void iris_transformer_release_prefix_qimage(iris_transformer_qimage_t *tf) {
+#ifdef IRIS_DEV
+    if (tf->dev) {
+        dev_free_prefix(tf);
+        dev_free_activations(tf->dev);
+    }
+#endif
+    tf->prefix_seq = 0;
+    free(tf->prefix_key);
+    tf->prefix_key = NULL;
+    tf->prefix_key_bytes = 0;
+    free(tf->prefix_kv);
+    tf->prefix_kv = NULL;
+    free(tf->work);
+    tf->work = NULL;
+    tf->work_elems = 0;
 }
 
 void iris_transformer_free_qimage(iris_transformer_qimage_t *tf) {

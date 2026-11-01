@@ -172,7 +172,8 @@ extern "C" void iris_dev_cleanup(void) {
     g_ready = 0;
 }
 
-extern "C" size_t iris_dev_memory(void) {
+extern "C" size_t iris_dev_memory(int held) {
+    (void)held;
     size_t avail = 0, total = 0;
     GPU(MemGetInfo)(&avail, &total);
     return avail;

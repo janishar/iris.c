@@ -72,9 +72,12 @@ typedef struct iris_transformer_qimage iris_transformer_qimage_t;
 iris_transformer_qimage_t *iris_transformer_load_qimage(const char *model_dir);
 void iris_transformer_free_qimage(iris_transformer_qimage_t *tf);
 
-/* Estimated peak memory of a prefill of rows prefix tokens, with the weights
- * if weights is set, from the config alone. On a GPU it is device memory. */
-size_t iris_transformer_memory_qimage(const char *model_dir, int rows, int weights);
+/* Estimated peak memory of a prefill of rows prefix tokens, from the config
+ * alone. On a GPU it is device memory, the weights included. */
+size_t iris_transformer_memory_qimage(const char *model_dir, int rows);
+
+/* Free the prefix and the activations. The next step needs a new prefill. */
+void iris_transformer_release_prefix_qimage(iris_transformer_qimage_t *tf);
 
 /* Latent channels the transformer reads and predicts (64). */
 int iris_transformer_channels_qimage(const iris_transformer_qimage_t *tf);
@@ -113,6 +116,9 @@ void iris_vae_free_qimage(iris_vae_qimage_t *vae);
 /* Allocate what a GPU decode of an h x w latent needs. Returns 0 if it does
  * not fit, 1 if it does or there is no GPU. */
 int iris_vae_reserve_qimage(iris_vae_qimage_t *vae, int h, int w);
+
+/* GPU activations of such a decode, 0 without a GPU. */
+size_t iris_vae_memory_qimage(const iris_vae_qimage_t *vae, int h, int w);
 
 /* Free the GPU activations and the encoder, leaving the decoder's weights
  * loaded. A later encode loads the encoder again. */

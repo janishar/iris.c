@@ -8,6 +8,7 @@
 #ifndef IRIS_QWEN3_H
 #define IRIS_QWEN3_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include "iris_safetensors.h"
 
@@ -198,6 +199,14 @@ float *qwen3_encode_text(qwen3_encoder_t *enc, const char *prompt);
  */
 float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
                               int *out_num_tokens, int *out_seq_len);
+
+/*
+ * Bytes of the Qwen-Image encoder's weights in the memory the run is limited
+ * by, from the config: the f32 token embeddings, and the layers as bf16 on a
+ * GPU, as f32 without mmap, not at all as clean mapped pages. The model
+ * directory is the pipeline's.
+ */
+size_t qwen3_memory(const char *model_dir, int use_mmap);
 
 /*
  * Encoder tokens of a Qwen-Image prompt with n images of slots[i] tokens,

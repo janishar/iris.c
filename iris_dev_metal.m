@@ -471,14 +471,15 @@ static id<MTLBuffer> find_buffer(const void *p, NSUInteger *offset) {
 
 /* The GPU's working set budget, capped by what the system can give without
  * paging: free pages and those it can drop (the file cache holds the weights). */
-size_t iris_dev_memory(void) {
-    size_t budget = g_device.recommendedMaxWorkingSetSize - g_device.currentAllocatedSize;
+size_t iris_dev_memory(int held) {
+    size_t budget = g_device.recommendedMaxWorkingSetSize, used = g_device.currentAllocatedSize;
+    budget = held ? budget : used < budget ? budget - used : 0;
     vm_statistics64_data_t vm;
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
     if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &count) !=
         KERN_SUCCESS) return budget;
     size_t system = (size_t)(vm.free_count + vm.external_page_count + vm.purgeable_count) *
-                    vm_page_size;
+                    vm_page_size + (held ? used : 0);
     return system < budget ? system : budget;
 }
 

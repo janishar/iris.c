@@ -568,15 +568,34 @@ With references (qwen3_encode_images):
   already works in query chunks of ATTN_SCRATCH.
 - ATTN_MAX_SCORES (2^31) sits above every byte-exact case: at 2^29 the 1-MP
   reference runs split, and MPSGraph rounds a split run differently.
-- iris_refs_fit_qimage() refuses a run before the first stage, from
-  qwen3_count_images() (tokenizer only) and iris_transformer_memory_qimage()
-  against iris_dev_memory() (Metal: the working set budget, capped by free and
-  file-backed pages) or 90% of the RAM on the CPU. The check is for references;
-  the estimate is from the config and was calibrated on Metal.
+- iris_fit_qimage() refuses a run before the first stage: over the token limit
+  (without the device path on Metal, mapped weights: 1280), or when the largest
+  stage does not fit. Stages: iris_transformer_memory_qimage() (prefix,
+  activations, weights on a GPU, and what MPSGraph holds, on Metal only),
+  qwen3_memory() (layer weights: device bf16; clean mapped pages on the CPU;
+  f32 with --no-mmap, twice that on Metal, whose cache copies them) and
+  iris_vae_memory_qimage(). Available: iris_dev_memory(held = 1) (Metal: the
+  working set budget, capped by free and file-backed pages and what the process
+  holds, since a new run replaces it; CUDA: free VRAM, after unloading the
+  transformer if that is short) or 90% of the RAM on the CPU. So a repeat is
+  judged like a first run. Every reference run is checked; a text-only run only
+  past 1280 tokens, so short prompts need no tokenizer and behave as before. The
+  Metal and CPU figures were measured, the CUDA one is computed.
+- Prefix: released after sampling when it has references or is past 1280 tokens
+  (iris_transformer_release_prefix_qimage()), so the decode and the next prompt
+  do not sit beside gigabytes nothing will read. Short text-only prefixes stay
+  for a repeated prompt.
+- Decode: dv_buffers() asks iris_dev_memory() first, since Metal allocates past
+  its budget. A decode that does not fit unloads the transformer.
+- Text-only: an encoder that does not fit beside the previous transformer
+  unloads it first.
+- Metal with mapped weights cannot run the CPU encoder path, so past 1280 tokens
+  without the device path the encoder fails with an error.
 - Measured on an M5 Pro with 64 GB, 8 Turbo steps at the default 1024x1024: 10
-  references take 142 s and 51.3 GB, 11 take 165 s and 51.5 GB, 12 are refused
-  (57.4 GB estimated against the 55.7 GB budget). Text encoder: 15 s and 20 GB
-  for 10600 tokens.
+  references take 140 s and 48-51 GB, 11 take 170 s and 49-54 GB (memory pressure
+  moves it), 12 are refused (57.3 GB estimated against the 55.7 GB budget). 8
+  references at 2048x2048: 338 s, 43.6 GB. --no-mmap past 1280 tokens on Metal is
+  refused (58.1 GB). Text encoder: 15 s and 20 GB for 10600 tokens.
 - A free run with two or more references can end far from float32 although
   each step does not: r9 (two references, a vague prompt) has velocities within
   1.5-2.3% and the latent 28% off. A 1e-6 noise change moves it 2e-5, and the

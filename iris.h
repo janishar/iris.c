@@ -182,8 +182,9 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
 /*
  * Multi-reference generation (up to 4 reference images for klein).
  * Qwen-Image: both calls size every reference to about 1024x1024 and, with
- * width or height 0, the target from the last reference; the references and
- * the prompt must fit in the 1280 text encoder tokens.
+ * width or height 0, the target from the last reference. The references and
+ * the prompt can take 17280 text encoder tokens (a reference about 1024); a
+ * run over that, or that does not fit in memory, fails before it starts.
  */
 iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
                           const iris_image **refs, int num_refs,

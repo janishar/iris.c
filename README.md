@@ -19,7 +19,7 @@ Supported model families:
   - Text-to-image, editing (`-i image`) and multi-reference generation (`-i` repeated).
 - **[Qwen-Image 2.1](https://huggingface.co/Qwen/Qwen-Image-2.1)** (by Qwen):
   - **Turbo** (fixed 8-step schedule, no CFG) and **base** (40 steps, no CFG). Qwen Research License (non-commercial).
-  - Text-to-image and editing (`-i image`, up to 16 references). Each reference is sized to about 1024x1024. The output size defaults to the last reference's aspect at about 1024x1024. A run that does not fit in memory is refused before it starts. Peak memory is about 24 GB for one reference and 51 GB for ten (2.5 minutes on an M5 Pro with 64 GB, which fits 11). The prompt and references can take up to 17280 text encoder tokens, and a reference takes about 1024.
+  - Text-to-image and editing (`-i image`, up to 16 references). Each reference is sized to about 1024x1024. The output size defaults to the last reference's aspect at about 1024x1024. A run that does not fit in memory is refused before it starts, for references and for prompts past 1280 tokens, a repeat in the same process included. Peak memory is about 24 GB for one reference and 48-51 GB for ten (2.5 minutes on an M5 Pro with 64 GB, which fits 11). The prompt and references can take up to 17280 text encoder tokens, and a reference takes about 1024.
 
 All the models run fully on the GPU with the Metal (Apple), CUDA (NVIDIA) and ROCm (AMD) backends.
 

@@ -530,9 +530,15 @@ static int dv_load(qv_net_t *n) {
 }
 
 /* Grow the activations to these element counts. */
+static size_t dv_bytes(size_t need, size_t skip, size_t attn) {
+    return (4 * need + skip) * sizeof(float) + attn * sizeof(uint16_t);
+}
+
 static int dv_buffers(struct qv_dev *d, size_t need, size_t skip, size_t attn) {
     if (need <= d->buf_elems && skip <= d->skip_elems && attn <= d->attn_elems) return 1;
     dv_free_buffers(d);
+    /* Metal allocates past its budget: ask first. */
+    if (dv_bytes(need, skip, attn) > iris_dev_memory(0)) return 0;
     int ok = 1;
     for (int i = 0; i < 4; i++) {
         d->buf[i] = iris_dev_alloc(need * sizeof(float));
@@ -550,10 +556,12 @@ static int dv_buffers(struct qv_dev *d, size_t need, size_t skip, size_t attn) {
     return 1;
 }
 
-/* Size the decoder activations for a latent of h x w pixels. */
-static int dv_ensure(qv_net_t *n, int h, int w) {
+/* Decoder activations for a latent of h x w pixels, in elements of each buffer. */
+static void dv_sizes(const qv_net_t *n, int h, int w, size_t *need_out, size_t *skip_out,
+                     size_t *attn_out) {
     size_t hw = (size_t)h * w, top = n->mid_res[0].cout;
-    size_t need = hw * 3 * top, skip = 0, attn = hw * 4 * top;
+    size_t need = hw * 3 * top, skip = 0;
+    *attn_out = hw * 4 * top;
     for (int i = 0; i < n->num_blocks; i++) {
         const qv_block_t *u = &n->block[i];
         size_t c = u->cin > u->cout ? u->cin : u->cout;
@@ -564,6 +572,13 @@ static int dv_ensure(qv_net_t *n, int h, int w) {
             if (hw * u->cout > need) need = hw * u->cout;
         }
     }
+    *need_out = need;
+    *skip_out = skip;
+}
+
+static int dv_ensure(qv_net_t *n, int h, int w) {
+    size_t need, skip, attn;
+    dv_sizes(n, h, w, &need, &skip, &attn);
     return dv_buffers(n->dev, need, skip, attn);
 }
 
@@ -620,6 +635,13 @@ int iris_vae_reserve_qimage(iris_vae_qimage_t *vae, int h, int w) {
     if (!iris_dev_available()) return 1;
     if (!vae->dec.dev && !dv_load(&vae->dec)) return 0;
     return dv_ensure(&vae->dec, h, w);
+}
+
+size_t iris_vae_memory_qimage(const iris_vae_qimage_t *vae, int h, int w) {
+    if (!iris_dev_available()) return 0;
+    size_t need, skip, attn;
+    dv_sizes(&vae->dec, h, w, &need, &skip, &attn);
+    return dv_bytes(need, skip, attn);
 }
 
 static iris_image *decode_dev(iris_vae_qimage_t *vae, const float *latent, int h, int w) {
@@ -769,6 +791,11 @@ static float *encode_dev(const iris_vae_qimage_t *vae, const float *rgba, int h,
 int iris_vae_reserve_qimage(iris_vae_qimage_t *vae, int h, int w) {
     (void)vae, (void)h, (void)w;
     return 1;
+}
+
+size_t iris_vae_memory_qimage(const iris_vae_qimage_t *vae, int h, int w) {
+    (void)vae, (void)h, (void)w;
+    return 0;
 }
 #endif /* IRIS_DEV */
 

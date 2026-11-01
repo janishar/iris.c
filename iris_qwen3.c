@@ -519,8 +519,6 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
         }
     }
 
-    /* Work buffers are pre-allocated in model, no free needed */
-
 #ifdef USE_METAL
 output_proj:
 #endif
@@ -1234,6 +1232,12 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
         goto concatenate;
 #endif
 #ifdef USE_METAL
+    /* Mapped bf16 weights run only on the GPU, and the native attention ends here. */
+    if (model->use_bf16 && seq_len > CAUSAL_ATTENTION_MAX_SEQ) {
+        fprintf(stderr, "Qwen3: %d tokens need the GPU device path\n", seq_len);
+        return NULL;
+    }
+
     /* Try fully GPU-resident path: 1 sync instead of 72, skips unneeded layers */
     if (model->use_bf16 && iris_metal_available()) {
         if (qwen3_forward_gpu(model, seq_len, attention_mask))
@@ -1503,7 +1507,7 @@ static void free_layer_weights(qwen3_layer_t *layer) {
 
 #ifdef QWEN3_DEV
 /* ========================================================================
- * GPU Forward (CUDA / ROCm)
+ * GPU Forward (CUDA / ROCm / Metal)
  * ======================================================================== */
 
 /* Device copy of one layer, with q/k/v and gate/up fused into one GEMM each. */
@@ -1671,7 +1675,7 @@ static int qwen3_forward_dev(qwen3_model_t *model, int seq_len, const int *atten
                              const int *out_layers, int num_out) {
     int last_layer = out_layers[num_out - 1];
     if (!qwen3_dev_prepare(model, last_layer, seq_len)) {
-        fprintf(stderr, "Qwen3: GPU allocation failed, using the CPU\n");
+        fprintf(stderr, "Qwen3: GPU allocation failed for %d tokens\n", seq_len);
         qwen3_dev_free(model);
         return 0;
     }
@@ -1970,8 +1974,6 @@ qwen3_model_t *qwen3_model_load(const char *model_dir) {
 
     for (int i = 0; i < num_files; i++) safetensors_close(files[i]);
 
-    /* Allocate working memory */
-
     return model;
 
 error:
@@ -2030,8 +2032,6 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
     /* DON'T load layer weights - they'll be loaded on-demand in forward pass */
     if (iris_verbose)
         fprintf(stderr, "Mmap mode: layer weights will be loaded on-demand\n");
-
-    /* Allocate working memory */
 
     return model;
 
@@ -2245,9 +2245,30 @@ float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
                                out_num_tokens, out_seq_len);
 }
 
+size_t qwen3_memory(const char *model_dir, int use_mmap) {
+    qwen3_model_t m = {0};
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/text_encoder", model_dir);
+    if (parse_qwen3_config(dir, &m) != 0) qwen3_set_defaults(&m);
+    size_t hidden = m.hidden_size, q_dim = (size_t)m.num_heads * m.head_dim;
+    size_t kv_dim = (size_t)m.num_kv_heads * m.head_dim;
+    size_t bf16 = m.num_layers * hidden * (2 * q_dim + 2 * kv_dim + 3 * m.intermediate_size) * 2;
+    size_t embed = m.vocab_size * hidden * sizeof(float);
+#ifdef USE_METAL
+    if (!use_mmap) return embed + bf16 * 4;   /* f32, and the GPU's copy of it */
+#elif defined(QWEN3_DEV)
+    if (iris_dev_available()) use_mmap = 1;   /* see qwen3_encoder_load() */
+#endif
+    if (!use_mmap) return embed + bf16 * 2;
+#ifdef QWEN3_DEV
+    if (iris_dev_available()) return embed + bf16;
+#endif
+    return embed;
+}
+
 int qwen3_count_images(const char *model_dir, const char *prompt, const int *slots, int n) {
     qwen3_tokenizer_t *tok = qwen3_tokenizer_load_dir(model_dir);
-    int *rows = malloc(n * sizeof(int));
+    int *rows = malloc((n + 1) * sizeof(int));
     int num_tokens = 0, num_system;
     if (tok && rows)
         free(qwen3_tokenize_chat_images(tok, QWEN3_QIMAGE_SYSTEM, prompt, slots, n,
