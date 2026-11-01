@@ -72,6 +72,7 @@ iris_sample.c             - Sampling/denoising loops (Euler ODE)
 iris_qwen3.c              - Qwen3 text encoder
 iris_qwen3_vision.c       - Qwen3-VL vision tower (Qwen-Image references)
 iris_qwen3_tokenizer.c    - BPE tokenizer (added tokens, NFC, Qwen2 pre-tokenizer)
+qwen3_rope_test.c         - Text encoder positions against a hand-written layout
 iris_nfc_table.h          - Unicode tables for NFC, from debug/gen_nfc_table.py
 iris_vae.c                - VAE encoder/decoder
 iris_kernels.c            - CPU kernels (softmax, RMSNorm, etc.)
@@ -719,6 +720,9 @@ Basic verification:
 ```bash
 make test
 ```
+
+`make test` starts with `make ropetest`, which needs no weights: rounding hides
+wrong text encoder positions in the images, so it checks the RoPE tables directly.
 
 Manual Flux sanity:
 ```bash

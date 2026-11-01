@@ -340,6 +340,7 @@ Run the test suite to verify your build produces correct output:
 ```bash
 make test        # Run all tests
 make test-quick  # Run only the quick 64x64 test
+make ropetest    # Check text encoder positions, no weights needed (part of make test)
 ```
 
 The tests compare generated images against reference images in `test_vectors/`. A test passes if the maximum pixel difference is within tolerance (to allow for minor floating-point variations across platforms).

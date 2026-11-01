@@ -22,7 +22,7 @@ LIB = libiris.a
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug lib install info test pngtest tokenizertest help generic blas mps cuda rocm
+.PHONY: all clean debug lib install info test pngtest tokenizertest ropetest help generic blas mps cuda rocm
 .NOTPARALLEL: mps
 
 # Default: show available targets
@@ -47,6 +47,7 @@ endif
 	@echo "  make test     - Run inference test"
 	@echo "  make pngtest  - Compare PNG load on compressed image"
 	@echo "  make tokenizertest TOKENIZER=<tokenizer.json> - Check prompt truncation"
+	@echo "  make ropetest - Check text encoder positions, no weights needed"
 	@echo "  make info     - Show build configuration"
 	@echo "  make lib      - Build static library"
 	@echo ""
@@ -166,7 +167,7 @@ debug: clean $(TARGET)
 # =============================================================================
 # Test and utilities
 # =============================================================================
-test:
+test: ropetest
 	@python3 run_test.py --flux-binary ./$(TARGET)
 
 test-quick:
@@ -185,6 +186,11 @@ tokenizertest:
 	@out=$$(./iris_tokenizer_test $(TOKENIZER) 2>&1); rc=$$?; rm -f iris_tokenizer_test; \
 	 test $$rc = 0 && test "$$(echo "$$out" | grep -c 'prompt truncated from')" = 1
 	@echo "TOKENIZER TEST PASSED"
+
+ropetest:
+	@$(CC) $(CFLAGS_BASE) -I. qwen3_rope_test.c iris_qwen3_tokenizer.c iris_safetensors.c iris_kernels.c -lm -o iris_rope_test
+	@./iris_rope_test; rc=$$?; rm -f iris_rope_test; test $$rc = 0
+	@echo "ROPE TEST PASSED"
 
 install: $(TARGET) $(LIB)
 	install -d /usr/local/bin

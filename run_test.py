@@ -119,8 +119,9 @@ FLUX3_TESTS = [
 # Failing it: a wrong position advance 1.72, one deepstack layer of three 2.04,
 # wrong reference position in the transformer 35. No MRoPE (0.83-0.96) and height
 # and width swapped (0.78-1.03) overlap correct output, no threshold splits them:
-# debug/dump_qimage_text.c sees both as different positions. Deepstack layers in
-# the wrong order give 0.72 and pass: only debug/dump_qimage_e2e.c on BLAS sees that.
+# make ropetest, run before these by make test, checks the positions directly.
+# Deepstack layers in the wrong order give 0.72 and pass: only
+# debug/dump_qimage_e2e.c on BLAS sees that.
 QIMAGE_TESTS = [
     {
         "name": "Qwen-Image 2.1 Turbo test (8 steps, 256x256)",
