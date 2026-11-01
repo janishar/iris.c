@@ -96,7 +96,8 @@ main.c                    - CLI entry point
 
 This project implements five targets:
 - MPS: Apple Silicon GPU path. The transformers use iris_dev.h
-  (iris_dev_metal.m); the text encoder and the VAE use iris_metal.m.
+  (iris_dev_metal.m), like Qwen-Image's text encoder and VAE; the other text
+  encoders and VAEs use iris_metal.m.
 - CUDA / ROCm: NVIDIA / AMD GPU path (iris_dev.h, implemented by iris_cuda.cu,
   one source for nvcc and hipcc). All the transformers, the Qwen3 text
   encoder and the VAE.
@@ -555,11 +556,15 @@ With references (qwen3_encode_images):
 # Qwen-Image Long Sequences
 
 - A reference takes about 1024 encoder tokens: two need 2100, ten 10300.
-- Metal encoder: up to CAUSAL_ATTENTION_MAX_SEQ (1280, threadgroup scores, Metal
-  allows 32 KB) the native iris_metal.m path, which FLUX.3 and the byte-exact
-  numbers rest on. Above it qwen3_forward_dev, the same path CUDA and ROCm use
-  for everything. Both are bf16, the device path is the closer one: text rows
-  1.1% against 6.0% off float32 at 1075 tokens, 1.6% at 2100, upstream bf16 6.8%.
+- Metal encoder: Qwen-Image always runs qwen3_forward_dev, the path CUDA and ROCm
+  use for everything (QWEN3_USE_DEV, keyed on the extraction mode). The other
+  models stay on the native iris_metal.m path, which ends at
+  CAUSAL_ATTENTION_MAX_SEQ (1280, threadgroup scores, Metal allows 32 KB) and
+  which FLUX.3's byte-exact hashes rest on. When the device path cannot allocate,
+  Qwen-Image falls back to it up to 1280 tokens. Time and memory are equal, and
+  the device path is closer: text rows 1.1% against 7.1% off float32 at 17 tokens,
+  1.3% against 6.7% at 1060, upstream bf16 7.0% and 6.8%. See pitfall 3 below for
+  why the final latent does not follow.
 - iris_dev_attention on Metal: GQA by broadcasting the query heads of a kv head
   against it, and queries split in chunks of ATTN_MAX_SCORES scores, raising
   causal (query i sees keys j < i + n). That is what runs a long causal segment
@@ -632,6 +637,12 @@ With references (qwen3_encode_images):
    (r2) by 1e-5 against 1.7e-6 with one reference, so that run ends 3.8% off
    on Metal and 4.4% off in upstream bf16, and 1e-4 off on the CPU in f32.
    Long sequences do the same: 2100 and 3100 tokens end 2.5e-4 off on the CPU.
+   The Metal transformer sets the floor of a text-only run, not the encoder.
+   On the f32 CPU transformer the native encoder's text error moves the latent
+   0.6-2.4%, the device encoder's 0.1-0.9%. On Metal, float32 embeddings end
+   0.8-4.4% off, about where the device encoder ends. Native against device
+   then scatters both ways: over 13 text-only runs a run moved by 0.47x to 2.4x,
+   the geometric mean by 1.01x. Upstream bf16 is 4.5% on the same 256x256 run.
 4. **Causal device attention**: the prefill is the only causal caller of
    iris_dev_attention in MPS builds. Metal used to return without writing, so
    text keys lost their attention output and velocities were 11-32% off.
@@ -664,8 +675,8 @@ With references (qwen3_encode_images):
   Work goes into one command buffer, committed by sync/download/upload/free.
   GEMMs and attention use MPSGraph (bf16 matmul, fused SDPA on contiguous
   copies of q/k/v, key mask and causal triangle as an additive bias). In MPS
-  builds the transformers, the Qwen-Image VAE and the encoder past 1280 tokens
-  use it: the Flux VAE device path is compiled out (VAE_DEV).
+  builds the transformers, the Qwen-Image VAE and the Qwen-Image encoder use
+  it: the Flux VAE device path is compiled out (VAE_DEV).
 
 Known pitfalls:
 1. rocBLAS has only fallback (slow) bf16 -> f32 GEMM kernels on gfx1151:

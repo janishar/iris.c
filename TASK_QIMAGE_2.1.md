@@ -57,6 +57,11 @@ the reference vectors. REPL: the first generation of a prompt is byte-identical
 to the CLI. A repeated prompt uses the 4-bit embedding cache, as on the other
 distilled models, and differs by a mean of 1.66/255.
 
+On Metal the Qwen-Image text encoder moved to the device path after these
+figures, so Qwen-Image output is no longer byte-identical to builds before that
+change. The bar for it is parity with the float32 pipeline. FLUX.3 stays on the
+native path, and its hashes (d9e500762989 text-to-image, 10f73fd0285a edit) stand.
+
 The GPU VAE decoder (`iris_dev_pixel_rms_norm`, `iris_dev_dup_up_add`) decodes
 the reference latents within a mean of 0.15/255 (max 12) on Metal and CUDA, which
 is bf16 rounding; the CPU decoder stays within 1/255.
@@ -634,9 +639,10 @@ executed.
 
 ### Gaps the plan must cover
 
-- **1280 token limit** (done, M8): sequences past the Metal threadgroup arrays go
-  through `qwen3_forward_dev`, `attn_scores` holds one head, work buffers follow
-  the real sequence. The limit is now 17280 tokens, 16 references and a prompt.
+- **1280 token limit** (done, M8): Qwen-Image's encoder runs `qwen3_forward_dev`
+  at every length on Metal, so it does not meet the threadgroup arrays,
+  `attn_scores` holds one head, work buffers follow the real sequence. The limit
+  is now 17280 tokens, 16 references and a prompt.
 - `iris_dev_head_norm_rope` cannot serve the vision tower: it normalizes and needs
   a power-of-two thread count.
 - `iris_image_convert` mishandles 2-channel input, `iris_image_resize` has no

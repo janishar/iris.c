@@ -31,15 +31,15 @@
 #include "iris_metal.h"
 #endif
 
-/* Device backend: the whole encoder on CUDA / ROCm. Metal builds keep the native
- * Metal encoder and use it only for what the native kernels cannot hold. */
+/* Device backend: the whole encoder on CUDA / ROCm. Metal uses it for Qwen-Image
+ * only, the other models keep the native Metal encoder. */
 #ifdef IRIS_DEV
 #define QWEN3_DEV
 #include "iris_dev.h"
 #ifdef USE_METAL
-#define QWEN3_DEV_MIN_SEQ (CAUSAL_ATTENTION_MAX_SEQ + 1)
+#define QWEN3_USE_DEV(model) ((model)->extraction_mode == QWEN3_EXTRACT_QIMAGE)
 #else
-#define QWEN3_DEV_MIN_SEQ 0
+#define QWEN3_USE_DEV(model) 1
 #endif
 #endif
 
@@ -1227,7 +1227,7 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
     /* Run through transformer layers */
 #ifdef QWEN3_DEV
     /* Whole forward pass on the GPU, weights from the mmap */
-    if (iris_dev_available() && model->use_mmap && seq_len >= QWEN3_DEV_MIN_SEQ &&
+    if (iris_dev_available() && model->use_mmap && QWEN3_USE_DEV(model) &&
         qwen3_forward_dev(model, seq_len, attention_mask, out_layers, num_out))
         goto concatenate;
 #endif
