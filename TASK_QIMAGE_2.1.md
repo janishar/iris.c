@@ -3,8 +3,7 @@
 Status: text-to-image implemented and verified on the real weights on MPS,
 CUDA and BLAS (see "Measured on the real weights"). ROCm has never been
 compiled. Phase 2 (reference images, any number up to memory) is implemented on
-MPS and BLAS, on CUDA it is not yet compiled. Delete this file when the work is
-merged.
+MPS, BLAS and CUDA. Delete this file when the work is merged.
 
 ## Implementation status
 
@@ -71,6 +70,14 @@ to 1.4e-2 on all three runs, free-run latent 1.7e-2 to 2.2e-2, reference test
 mean 1.07. Turbo 1024x1024 takes 4.5 s (1.6 s denoising, 0.4 s decode), base
 11.1 s, and 2048x2048, 2752x1536 and 1536x2752 take 13 s. With the VAE on the GPU,
 Turbo on MPS takes 26.7 s at 1024x1024 (was 52 s), base 117 s (was 139 s).
+
+References on the same CUDA machine, against the float32 dumps. VAE encoder 5.2e-3
+to 1.2e-2, vision tower 2.4-7.7%, positions and tokens identical up to 9348
+tokens, text rows 1.4-2.1% and 0.7% for a 2883-token prompt, velocities 3.1e-3 to
+3.4e-2. Final latent: r1 1.35%, r3 0.64%, r8 1.08%, r2 7.1%, r12 5.9%, r9 5.7%, r10
+11.2%, r_long 0.8% in a free run. run_test.py: 4.61, 3.38, 1.07, 0.72, 3.42 (bf16
+rounding drawn differently, see Qwen-Image Known Pitfalls in AGENT.md).
+Text-to-image is byte-identical to the build before Phase 2, at 256 and 1024.
 
 MPS at 2048x2048 and 2752x1536: 150 s (128 s denoising), peak footprint 44 GB, no
 transformer eviction needed.

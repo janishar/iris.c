@@ -19,12 +19,16 @@
  *      iris_metal.o iris_dev_metal.o -lm -framework Accelerate -framework Metal \
  *      -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
  *      -framework Foundation
+ * After make cuda:
+ *   gcc -O3 -march=native -ffast-math -DIRIS_DEV -I. -o /tmp/dump_qimage_refs debug/dump_qimage_refs.c \
+ *      $(ls *.o | grep -v -e '^main.o' -e '^iris_transformer_qimage.o') \
+ *      -lm -L$CUDA_HOME/lib64 -lcublas -lcudart -lstdc++
  *
  * Usage: dump_qimage_refs MODEL_DIR REF_DIR LATENT_H LATENT_W
  *
  * Reads from REF_DIR: emb.bin, noise.bin, sigmas.txt, step<i>_x.bin,
  * step<i>_v.bin, latent.bin, rope_cos.bin, rope_sin.bin, block<l>_s<0|1>.bin
- * and, with references, segments.txt, grid_thw.txt (reference sizes),
+ * (skipped if absent) and, with references, segments.txt, grid_thw.txt (reference sizes),
  * image_pad_mask.txt and ref<i>_latent.bin. Prints relative L2 errors.
  */
 
@@ -97,6 +101,14 @@ static double rel_l2(const float *a, const float *b, size_t n) {
  * Step 1: the whole of block<l>_s1, which has only the target rows. */
 static void block_hook(iris_transformer_qimage_t *tf, const float *x, int rows) {
     if (hook_step < -1 || hook_step > 1) return;
+    char name[64];
+    snprintf(name, sizeof(name), "block%d_s%d.bin", hook_block, hook_step == 1 ? 1 : 0);
+    FILE *f = open_ref(name, "rb");
+    if (!f) {   /* run without --blocks: velocities and the free run only */
+        hook_block++;
+        return;
+    }
+    fclose(f);
     size_t n = (size_t)rows * tf->dim;
     float *host = malloc(n * sizeof(float));
 #ifdef IRIS_DEV
@@ -104,8 +116,6 @@ static void block_hook(iris_transformer_qimage_t *tf, const float *x, int rows) 
     else
 #endif
     memcpy(host, x, n * sizeof(float));
-    char name[64];
-    snprintf(name, sizeof(name), "block%d_s%d.bin", hook_block, hook_step == 1 ? 1 : 0);
     size_t first = hook_step == 0 ? (size_t)tf->prefix_seq * tf->dim : 0;
     float *ref = read_range(name, first, n);
     double e = rel_l2(host, ref, n);

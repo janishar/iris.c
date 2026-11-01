@@ -1306,7 +1306,7 @@ error:
 #define QI_GRAPH_BYTES 0
 #endif
 
-size_t iris_transformer_memory_qimage(const char *model_dir, int rows) {
+size_t iris_transformer_memory_qimage(const char *model_dir, int rows, int text_rows) {
     char cfg[8192];
     if (!read_config(model_dir, cfg, sizeof(cfg))) return 0;
     size_t dim = (size_t)config_num(cfg, "num_attention_heads", 32) *
@@ -1319,10 +1319,17 @@ size_t iris_transformer_memory_qimage(const char *model_dir, int rows) {
      * references, measured). On the CPU the weights are clean mapped pages,
      * and the 2 GB are the stages' leftovers next to the prefix (r9). */
     size_t kv_bytes = 4, fixed = (size_t)2 << 30;
+    (void)text_rows;   /* CUDA and ROCm only */
 #ifdef IRIS_DEV
     if (iris_dev_available()) {
         kv_bytes = 2;
         fixed = QI_GRAPH_BYTES + layers * (4 * dim * dim + 3 * mlp * dim) * 2;
+#ifndef USE_METAL
+        /* Causal text takes the GEMM attention: scores in f32 and bf16 for
+         * every head, up to ATTN_SCRATCH, and its input projections. */
+        size_t scores = (size_t)text_rows * text_rows * dim / 128 * 6;
+        fixed += (scores < ATTN_SCRATCH ? scores : ATTN_SCRATCH) + (size_t)text_rows * dim * 6;
+#endif
     }
 #endif
     size_t row = layers * 2 * dim * kv_bytes + 18 * dim + 6 * mlp + 4 * dim;

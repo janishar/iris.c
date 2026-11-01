@@ -1367,9 +1367,10 @@ static iris_image *iris_generate_qimage_with_embeddings(iris_ctx *ctx,
 
 /* What the sequence limit and the memory of this machine allow: refuse a run
  * before any stage has spent time on it. tokens: text encoder sequence, rows:
- * prefix and target tokens, h x w: target latent. The stages run one at a time,
- * except that a decode too large for the transformer's company unloads it. */
-static int iris_fit_qimage(iris_ctx *ctx, int tokens, int rows, int h, int w) {
+ * prefix and target tokens, text_rows: those that are text, h x w: target
+ * latent. The stages run one at a time, except that a decode too large for the
+ * transformer's company unloads it. */
+static int iris_fit_qimage(iris_ctx *ctx, int tokens, int rows, int text_rows, int h, int w) {
     int limit = QWEN3_QIMAGE_MAX_SEQ_LEN;
 #ifdef USE_METAL
     if (ctx->use_mmap && !iris_dev_available()) limit = CAUSAL_ATTENTION_MAX_SEQ;
@@ -1381,7 +1382,7 @@ static int iris_fit_qimage(iris_ctx *ctx, int tokens, int rows, int h, int w) {
         set_error(err);
         return 0;
     }
-    size_t need = iris_transformer_memory_qimage(ctx->model_dir, rows);
+    size_t need = iris_transformer_memory_qimage(ctx->model_dir, rows, text_rows);
     size_t text = qwen3_memory(ctx->model_dir, ctx->use_mmap);
     size_t decode = iris_vae_memory_qimage(ctx->qimage_vae, h, w);
     if (text > need) need = text;
@@ -1410,7 +1411,8 @@ static iris_image *iris_generate_qimage(iris_ctx *ctx, const char *prompt,
         iris_params p = params ? *params : (iris_params)IRIS_PARAMS_DEFAULT;
         if (!iris_size_qimage(&p)) return NULL;
         int h = p.height / 16, w = p.width / 16;
-        if (tokens > QWEN3_VL_MAX_SEQ_LEN && !iris_fit_qimage(ctx, tokens, tokens + h * w, h, w))
+        if (tokens > QWEN3_VL_MAX_SEQ_LEN &&
+            !iris_fit_qimage(ctx, tokens, tokens + h * w, tokens, h, w))
             return NULL;
     }
 
@@ -1496,7 +1498,8 @@ static int iris_refs_fit_qimage(iris_ctx *ctx, const char *prompt, iris_image **
     }
     int tokens = qwen3_count_images(ctx->model_dir, prompt, slots, n);
     free(slots);
-    return iris_fit_qimage(ctx, tokens, tokens - slot_tokens + ref_tokens + h * w, h, w);
+    return iris_fit_qimage(ctx, tokens, tokens - slot_tokens + ref_tokens + h * w,
+                           tokens - slot_tokens, h, w);
 }
 
 /* The pipeline with reference images, one stage at a time so that each is

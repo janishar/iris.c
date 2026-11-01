@@ -20,6 +20,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define ATTN_SCRATCH ((size_t)1 << 30)  /* CUDA/ROCm score buffer budget (bytes) */
+
 #ifdef __cplusplus
 extern "C" {
 #endif

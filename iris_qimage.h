@@ -72,9 +72,10 @@ typedef struct iris_transformer_qimage iris_transformer_qimage_t;
 iris_transformer_qimage_t *iris_transformer_load_qimage(const char *model_dir);
 void iris_transformer_free_qimage(iris_transformer_qimage_t *tf);
 
-/* Estimated peak memory of a prefill of rows prefix tokens, from the config
- * alone. On a GPU it is device memory, the weights included. */
-size_t iris_transformer_memory_qimage(const char *model_dir, int rows);
+/* Estimated peak memory of a prefill of rows prefix tokens, text_rows of them
+ * text, from the config alone. On a GPU it is device memory, the weights
+ * included. */
+size_t iris_transformer_memory_qimage(const char *model_dir, int rows, int text_rows);
 
 /* Free the prefix and the activations. The next step needs a new prefill. */
 void iris_transformer_release_prefix_qimage(iris_transformer_qimage_t *tf);

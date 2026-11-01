@@ -18,6 +18,10 @@
  *      $(ls *.mps.o | grep -vE '^(main|iris_vae_qimage)\.mps\.o') iris_metal.o iris_dev_metal.o \
  *      -lm -framework Accelerate -framework Metal -framework MetalPerformanceShaders \
  *      -framework MetalPerformanceShadersGraph -framework Foundation
+ * After make cuda:
+ *   gcc -O3 -march=native -ffast-math -DIRIS_DEV -I. -o /tmp/cmp_vae_enc debug/cmp_qimage_vae_enc.c \
+ *      $(ls *.o | grep -vE '^(main|iris_vae_qimage|iris_cli|linenoise|embcache)\.o') \
+ *      -lm -L$CUDA_HOME/lib64 -lcublas -lcudart -lstdc++
  *
  * Usage: cmp_vae_enc MODEL_DIR REF_DIR NUM_REFS H W [TOLERANCE]
  *

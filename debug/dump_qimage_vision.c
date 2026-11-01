@@ -15,6 +15,10 @@
  *      iris_metal.o iris_dev_metal.o -lm -framework Accelerate -framework Metal \
  *      -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
  *      -framework Foundation
+ * CUDA (after make cuda):
+ *   gcc -O3 -march=native -ffast-math -DIRIS_DEV -I. -o /tmp/dump_vision debug/dump_qimage_vision.c \
+ *      $(ls *.o | grep -v 'iris_qwen3_vision\|^main\|iris_cli\|linenoise\|embcache') \
+ *      -lm -L$CUDA_HOME/lib64 -lcublas -lcudart -lstdc++
  *
  * Usage: dump_qimage_vision TEXT_ENCODER_DIR REF_DIR
  *

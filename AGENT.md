@@ -578,7 +578,8 @@ With references (qwen3_encode_images):
 - iris_fit_qimage() refuses a run before the first stage: over the token limit
   (without the device path on Metal, mapped weights: 1280), or when the largest
   stage does not fit. Stages: iris_transformer_memory_qimage() (prefix,
-  activations, weights on a GPU, and what MPSGraph holds, on Metal only),
+  activations, weights on a GPU, what MPSGraph holds on Metal, the scores of
+  causal text in the GEMM attention and its input on CUDA and ROCm),
   qwen3_memory() (layer weights: device bf16; clean mapped pages on the CPU;
   f32 with --no-mmap, twice that on Metal, whose cache copies them) and
   iris_vae_memory_qimage(). Available: iris_dev_memory(held = 1) (Metal: the
@@ -587,7 +588,7 @@ With references (qwen3_encode_images):
   transformer if that is short) or 90% of the RAM on the CPU. So a repeat is
   judged like a first run. Every reference run is checked; a text-only run only
   past 1280 tokens, so short prompts need no tokenizer and behave as before. The
-  Metal and CPU figures were measured, the CUDA one is computed.
+  figures were measured on all three, ROCm excepted.
 - Prefix: released after sampling when it has references or is past 1280 tokens
   (iris_transformer_release_prefix_qimage()), so the decode and the next prompt
   do not sit beside gigabytes nothing will read. Short text-only prefixes stay
@@ -603,6 +604,16 @@ With references (qwen3_encode_images):
   moves it), 12 are refused (57.3 GB estimated against the 55.7 GB budget). 8
   references at 2048x2048: 338 s, 43.6 GB. --no-mmap past 1280 tokens on Metal is
   refused (58.1 GB). Text encoder: 15 s and 20 GB for 10600 tokens.
+- Measured on an RTX PRO 6000 (97.9 GB) with 29.5 GB free beside other GPU
+  processes, Turbo, 1024x1024, estimate against sampled peak of the prefill stage
+  (the CUDA context of 0.6 GB left out, it is outside the free figure): 1 reference
+  19.7 / 18.6 GB, 2 references 22.5 / 21.4, 3 references 25.3 / 24.2, 4 references
+  28.1 / 27.1, 2895 tokens 17.3 / 17.4, 17280 tokens 27.5 / 27.4. With 20.0 GB
+  free one reference runs and the transformer unloads for the decode, with 19.2 GB
+  it is refused in 0.8 s. 5 references (31.0 GB) and 10 (45.2 GB) were refused
+  in 0.8 s; the fit also unloads a transformer left by a generation (14.1 GB free).
+  Time: 1 reference 5.5 s, 2 references 6.3 s, 4 references 8.1 s, 17280 tokens
+  11.2 s. Text encoder at 9348 tokens: 16.2 GB, 5 s.
 - A free run with two or more references can end far from float32 although
   each step does not: r9 (two references, a vague prompt) has velocities within
   1.5-2.3% and the latent 28% off. A 1e-6 noise change moves it 2e-5, and the
@@ -639,6 +650,11 @@ With references (qwen3_encode_images):
    (r2) by 1e-5 against 1.7e-6 with one reference, so that run ends 3.8% off
    on Metal and 4.4% off in upstream bf16, and 1e-4 off on the CPU in f32.
    Long sequences do the same: 2100 and 3100 tokens end 2.5e-4 off on the CPU.
+   The ending point of such a run is one draw of the rounding: on r12, 1e-5 of
+   noise gives 2.3-4.2% on Metal and 1.9-9.2% on CUDA, and float32 inputs 2.9-7.2%
+   and 3.9-9.1%, with the same velocities (1-3%). So r2 ends 7.1% and r12 5.9% off
+   on CUDA (3.9% and 2.8% on Metal), the two-reference test measures 3.42 (1.86)
+   and its threshold is 6. One reference ends where Metal does (0.6-1.3%).
    The Metal transformer sets the floor of a text-only run, not the encoder.
    On the f32 CPU transformer the native encoder's text error moves the latent
    0.6-2.4%, the device encoder's 0.1-0.9%. On Metal, float32 embeddings end

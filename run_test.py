@@ -142,8 +142,10 @@ QIMAGE_TESTS = [
         "mean_diff_threshold": 0.8,
     },
     {
-        # 2100 encoder tokens, past the native Metal kernels. Correct output on
-        # Metal measures 1.86. Failing it: no position advance after the second
+        # 2100 encoder tokens, past the native Metal kernels. Correct output
+        # measures 1.86 on Metal and 3.42 on CUDA, and two references make the
+        # result depend on the rounding: changing the noise by 1e-5 gives 1.5-2.6
+        # on Metal and 1.3-5.2 on CUDA with the same per-step error. Failing it: no position advance after the second
         # reference 9.4 (transformer) and 13 (encoder), no deepstack on the device
         # path 12, wrong reference frame 27, device encoder not causal or with
         # the wrong GQA groups 95.
@@ -156,7 +158,7 @@ QIMAGE_TESTS = [
         "inputs": ["test_vectors/qimage_edit_input_384x512.png",
                    "test_vectors/img2img_input_256x256.png"],
         "reference": "test_vectors/reference_qimage_turbo_tworef_8step_256x256_seed42.png",
-        "mean_diff_threshold": 3,
+        "mean_diff_threshold": 6,
     },
 ]
 

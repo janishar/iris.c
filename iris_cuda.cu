@@ -57,7 +57,6 @@ typedef cudaDeviceProp dev_prop_t;
 
 #define ROW_THREADS 256     /* Threads for one-row-per-block kernels */
 #define EW_THREADS 256      /* Threads for elementwise kernels */
-#define ATTN_SCRATCH ((size_t)1 << 30)  /* Score buffer budget (bytes) */
 #define CONV_SCRATCH ((size_t)256 << 20) /* im2col buffer budget (bytes) */
 #define GN_BLOCKS 64                     /* Blocks per group for GroupNorm stats */
 #define STAGE_BYTES ((size_t)64 << 20)   /* Pinned upload staging buffer (CUDA, each of 2) */

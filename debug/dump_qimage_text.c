@@ -18,6 +18,10 @@
  *      iris_metal.o iris_dev_metal.o -lm -framework Accelerate -framework Metal \
  *      -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
  *      -framework Foundation
+ * After make cuda:
+ *   gcc -O3 -march=native -ffast-math -DIRIS_DEV -I. -o /tmp/dump_qimage_text debug/dump_qimage_text.c \
+ *      $(ls *.o | grep -v -e '^main.o' -e '^iris_qwen3.o') \
+ *      -lm -L$CUDA_HOME/lib64 -lcublas -lcudart -lstdc++
  *
  * Usage: dump_qimage_text MODEL_DIR REF_DIR PROMPT [MMAP (default 1)]
  *

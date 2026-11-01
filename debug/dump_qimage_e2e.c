@@ -15,6 +15,9 @@
  *      iris_metal.o iris_dev_metal.o -lm -framework Accelerate -framework Metal \
  *      -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
  *      -framework Foundation
+ * After make cuda:
+ *   gcc -O3 -march=native -ffast-math -DIRIS_DEV -I. -o /tmp/dump_qimage_e2e debug/dump_qimage_e2e.c \
+ *      $(ls *.o | grep -v -e '^main.o') -lm -L$CUDA_HOME/lib64 -lcublas -lcudart -lstdc++
  *
  * Usage: dump_qimage_e2e MODEL_DIR REF_DIR OUT W H RESOLUTION PROMPT IMAGE...
  * W H and RESOLUTION as qimage_reference.py -W -H --ref-resolution, 0 for
