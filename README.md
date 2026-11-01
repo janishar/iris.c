@@ -440,6 +440,23 @@ The MPS implementation is faster than the PyTorch optimized pipeline at all reso
 - The `make generic` backend (pure C, no BLAS) is approximately 30x slower than BLAS and not included in benchmarks.
 - The fastest implementation for Metal remains [the Draw Things app](https://drawthings.ai/) that can produce a 1024x1024 image in just 14.23 seconds (in the same hardware), however it is worth noting that it uses 6-bit quantized weights, while this implementation uses the official BF16 weights. The 6-bit quantization used by Draw Things provides both a big memory win and a moderate speed advantage (not nearly as much as it could in an LLM, where causal attention is dominated by memory bandwidth); if we account for this, the performance is comparable.
 
+### Qwen-Image 2.1 against PyTorch
+
+Apple M5 Pro (64GB RAM), same prompt, seed and noise, 1024x1024 unless noted. iris
+uses BF16 weights on Metal; PyTorch is the official diffusers pipeline in BF16 on
+MPS. Warm runs, seconds for the denoising loop / the whole process, then peak
+memory footprint:
+
+| Case | iris | PyTorch |
+|------|------|---------|
+| Turbo, 8 steps | 20.8 / 26.7, 25GB | 24.9 / 35.8, 47GB |
+| Base, 40 steps | 100.8 / 106.6, 23GB | 122.8 / 137.9, 48GB |
+| Turbo, 512x512 | 4.6 / 9.1, 20GB | 5.5 / 13.6, 37GB |
+| Turbo, one reference, 512x512 | 8.3 / 14.6, 22GB | 10.3 / 20.5, 40GB |
+
+From a cold file cache PyTorch loads faster: Turbo ties at 1024x1024 and wins by
+about 4s at 512x512. PyTorch's VAE decode is also about 25% faster.
+
 ### Timings on recent GPUs
 
 FLUX.3 Image Klein distilled, default 16 steps, wall clock including model

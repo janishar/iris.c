@@ -790,10 +790,28 @@ static void iris_load_text_encoder_if_needed(iris_ctx *ctx) {
  * For Z-Image, takes hidden_states[-2] and reports the real (unpadded) token
  * count via out_seq_len. The returned embedding buffer is still max-seq padded;
  * Z-Image consumes only the first out_seq_len tokens. */
+/* Memory a stage can use: device memory on a GPU (iris_dev_memory()), otherwise
+ * most of the RAM. */
+static size_t iris_available_memory(int held) {
+#ifdef IRIS_DEV
+    if (iris_dev_available()) return iris_dev_memory(held);
+#else
+    (void)held;
+#endif
+    return (size_t)sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE) / 10 * 9;
+}
+
 float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
     if (!ctx || !prompt) {
         *out_seq_len = 0;
         return NULL;
+    }
+
+    /* The encoder sits beside a previous generation's transformer if it fits. */
+    if (ctx->qimage_transformer && !ctx->qwen3_encoder &&
+        qwen3_memory(ctx->model_dir, ctx->use_mmap) > iris_available_memory(0)) {
+        iris_transformer_free_qimage(ctx->qimage_transformer);
+        ctx->qimage_transformer = NULL;
     }
 
     iris_load_text_encoder_if_needed(ctx);
@@ -1347,17 +1365,6 @@ static iris_image *iris_generate_qimage_with_embeddings(iris_ctx *ctx,
     return img;
 }
 
-/* Memory a stage can use: device memory on a GPU (iris_dev_memory()), otherwise
- * most of the RAM. */
-static size_t iris_available_memory(int held) {
-#ifdef IRIS_DEV
-    if (iris_dev_available()) return iris_dev_memory(held);
-#else
-    (void)held;
-#endif
-    return (size_t)sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE) / 10 * 9;
-}
-
 /* What the sequence limit and the memory of this machine allow: refuse a run
  * before any stage has spent time on it. tokens: text encoder sequence, rows:
  * prefix and target tokens, h x w: target latent. The stages run one at a time,
@@ -1405,12 +1412,6 @@ static iris_image *iris_generate_qimage(iris_ctx *ctx, const char *prompt,
         int h = p.height / 16, w = p.width / 16;
         if (tokens > QWEN3_VL_MAX_SEQ_LEN && !iris_fit_qimage(ctx, tokens, tokens + h * w, h, w))
             return NULL;
-    }
-    /* The encoder sits beside a previous generation's transformer if it fits. */
-    if (ctx->qimage_transformer &&
-        qwen3_memory(ctx->model_dir, ctx->use_mmap) > iris_available_memory(0)) {
-        iris_transformer_free_qimage(ctx->qimage_transformer);
-        ctx->qimage_transformer = NULL;
     }
 
     int text_seq;

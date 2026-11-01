@@ -556,12 +556,14 @@ With references (qwen3_encode_images):
 # Qwen-Image Long Sequences
 
 - A reference takes about 1024 encoder tokens: two need 2100, ten 10300.
-- Metal encoder: Qwen-Image always runs qwen3_forward_dev, the path CUDA and ROCm
-  use for everything (QWEN3_USE_DEV, keyed on the extraction mode). The other
-  models stay on the native iris_metal.m path, which ends at
+- Metal encoder: with mapped weights Qwen-Image runs qwen3_forward_dev, the path
+  CUDA and ROCm use for everything (QWEN3_USE_DEV, keyed on the extraction mode).
+  The other models stay on the native iris_metal.m path, which ends at
   CAUSAL_ATTENTION_MAX_SEQ (1280, threadgroup scores, Metal allows 32 KB) and
-  which FLUX.3's byte-exact hashes rest on. When the device path cannot allocate,
-  Qwen-Image falls back to it up to 1280 tokens. Time and memory are equal, and
+  which FLUX.3's byte-exact hashes rest on. Qwen-Image falls back to it up to 1280
+  tokens when the device path cannot allocate or is not initialized; --no-mmap
+  and library callers without iris_set_mmap() also stay on it, with different
+  output. Time and memory are equal, and
   the device path is closer: text rows 1.1% against 7.1% off float32 at 17 tokens,
   1.3% against 6.7% at 1060, upstream bf16 7.0% and 6.8%. See pitfall 3 below for
   why the final latent does not follow.
@@ -593,7 +595,7 @@ With references (qwen3_encode_images):
 - Decode: dv_buffers() asks iris_dev_memory() first, since Metal allocates past
   its budget. A decode that does not fit unloads the transformer.
 - Text-only: an encoder that does not fit beside the previous transformer
-  unloads it first.
+  unloads it first (in iris_encode_text(), so the REPL does too).
 - Metal with mapped weights cannot run the CPU encoder path, so past 1280 tokens
   without the device path the encoder fails with an error.
 - Measured on an M5 Pro with 64 GB, 8 Turbo steps at the default 1024x1024: 10
@@ -643,8 +645,8 @@ With references (qwen3_encode_images):
    0.8-4.4% off, about where the device encoder ends. Native against device
    then scatters both ways: over 13 text-only runs a run moved by 0.47x to 2.4x,
    the geometric mean by 1.01x. Upstream bf16 is 4.5% on the same 256x256 run.
-4. **Causal device attention**: the prefill is the only causal caller of
-   iris_dev_attention in MPS builds. Metal used to return without writing, so
+4. **Causal device attention**: the prefill and the Qwen-Image encoder are the
+   causal callers of iris_dev_attention in MPS builds. Metal used to return without writing, so
    text keys lost their attention output and velocities were 11-32% off.
 5. **VAE memory**: a 2048x2048 decode needs about 22 GB of GPU activations. When
    they do not fit next to the transformer, it is unloaded first (the next
